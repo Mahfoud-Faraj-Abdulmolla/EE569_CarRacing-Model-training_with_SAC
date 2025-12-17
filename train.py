@@ -599,7 +599,7 @@ def main():
             training_results['eval_rewards'].append({
                 'episode': episode,
                 'mean_reward': eval_reward,
-                'episode_rewards': eval_episodes.tolist()
+                'episode_rewards': eval_episodes
             })
             
             writer.add_scalar('Reward/evaluation', eval_reward, episode)
@@ -692,3 +692,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
