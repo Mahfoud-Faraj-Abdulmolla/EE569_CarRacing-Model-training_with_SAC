@@ -9,6 +9,8 @@ import random
 from collections import deque
 import os
 from torch.utils.tensorboard import SummaryWriter
+import json
+from datetime import datetime
 
 # ============================================================================
 # HYPERPARAMETERS
@@ -29,17 +31,19 @@ LR_SCHEDULE = True
 INITIAL_EXPLORATION_STEPS = 5000
 EXPLORATION_NOISE = 0.1
 
-EVAL_FREQUENCY = 100
-NUM_EVAL_EPISODES = 3
+EVAL_FREQUENCY = 100  
+NUM_EVAL_EPISODES = 3  
 SAVE_FREQUENCY = 100
 VIDEO_DIR = "./videos"
 CHECKPOINT_DIR = "./checkpoints"
+LOG_DIR = "./logs"
+RESULTS_FILE = "./training_results.json"
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-os.makedirs(VIDEO_DIR, exist_ok=True)
-os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
+for dir_path in [VIDEO_DIR, CHECKPOINT_DIR, LOG_DIR]:
+    os.makedirs(dir_path, exist_ok=True)
 
 # ============================================================================
 # ENVIRONMENT WRAPPERS
@@ -420,19 +424,46 @@ class SACAgent:
             'td_error': td_errors.mean()
         }, td_errors.mean()
 
+    def evaluate(self, env, num_episodes=3):
+        """تقييم الوكيل لعدد محدد من الحلقات (كما يطلب الأسايمنت)"""
+        total_rewards = []
+        
+        for episode in range(num_episodes):
+            state, _ = env.reset()
+            episode_reward = 0
+            done = False
+            
+            while not done:
+                action = self.select_action(state, evaluate=True)
+                next_state, reward, terminated, truncated, _ = env.step(action)
+                done = terminated or truncated
+                
+                episode_reward += reward
+                state = next_state
+                
+                # إيقاف مبكر إذا كان الأداء سيئاً جداً
+                if episode_reward < -100:
+                    break
+            
+            total_rewards.append(episode_reward)
+        
+        return np.mean(total_rewards), total_rewards
+
     def save_actor_for_inference(self, path):
-        """Saves only actor weights for inference (lightweight)."""
+        """يحفظ فقط أوزان الـactor للاستدلال"""
         torch.save(self.actor.state_dict(), path)
 
-    def save_checkpoint(self, path):
-        """Saves full checkpoint for resuming training."""
+    def save_checkpoint(self, path, episode, eval_reward):
+        """يحفظ الـcheckpoint الكامل"""
         torch.save({
+            'episode': episode,
             'actor_state_dict': self.actor.state_dict(),
             'critic_state_dict': self.critic.state_dict(),
             'critic_target_state_dict': self.critic_target.state_dict(),
             'actor_optimizer_state_dict': self.actor_optimizer.state_dict(),
             'critic_optimizer_state_dict': self.critic_optimizer.state_dict(),
             'total_steps': self.total_steps,
+            'eval_reward': eval_reward,
         }, path)
 
     def load_checkpoint(self, path):
@@ -443,112 +474,219 @@ class SACAgent:
         self.actor_optimizer.load_state_dict(checkpoint['actor_optimizer_state_dict'])
         self.critic_optimizer.load_state_dict(checkpoint['critic_optimizer_state_dict'])
         self.total_steps = checkpoint['total_steps']
+        return checkpoint['episode'], checkpoint.get('eval_reward', 0)
 
 
 # ============================================================================
-# TRAINING
+# TRAINING WITH PROPER EVALUATION
 # ============================================================================
 def main():
-    writer = SummaryWriter("runs/car_racing_sac")
-
+    # تهيئة TensorBoard
+    current_time = datetime.now().strftime("%Y%m%d-%H%M%S")
+    writer = SummaryWriter(f"{LOG_DIR}/sac_{current_time}")
+    
     print("=" * 70)
-    print("CarRacing-v3 SAC Training")
+    print("CAR RACING - SAC TRAINING")
     print("=" * 70)
     print(f"Device: {device}")
-    print(f"Episodes: {NUM_EPISODES}")
-    print(f"Batch size: {BATCH_SIZE}")
+    print(f"Training episodes: {NUM_EPISODES}")
+    print(f"Evaluation: {NUM_EVAL_EPISODES} episodes every {EVAL_FREQUENCY} training episodes")
+    print(f"Target reward: > 700 (assignment requirement)")
     print("=" * 70)
-
-    env = make_env()
-    state_dim = env.observation_space.shape
-    action_dim = env.action_space.shape[0]
-
-    print(f"State shape: {state_dim}")
-    print(f"Action shape: {action_dim}")
-
+    
+    # إنشاء بيئات
+    train_env = make_env()
+    eval_env = make_env()  # بيئة منفصلة للتقييم
+    
+    state_dim = train_env.observation_space.shape
+    action_dim = train_env.action_space.shape[0]
+    
+    print(f"State dimension: {state_dim}")
+    print(f"Action dimension: {action_dim}")
+    
+    # تهيئة الوكيل والذاكرة
     agent = SACAgent(state_dim, action_dim)
     memory = PrioritizedReplayBuffer(MEMORY_SIZE)
-
-    best_reward = -float('inf')
-    total_steps = 0
-    episode_rewards = []
-
-    print("\nInitial exploration...")
-    state, _ = env.reset()
-    for _ in range(INITIAL_EXPLORATION_STEPS):
-        action = env.action_space.sample()
-        next_state, reward, terminated, truncated, _ = env.step(action)
+    
+    # تتبع نتائج التدريب
+    training_results = {
+        'hyperparameters': {
+            'num_episodes': NUM_EPISODES,
+            'batch_size': BATCH_SIZE,
+            'learning_rate': LEARNING_RATE,
+            'gamma': GAMMA,
+            'tau': TAU,
+            'memory_size': MEMORY_SIZE,
+            'hidden_size': HIDDEN_SIZE,
+            'initial_exploration': INITIAL_EXPLORATION_STEPS,
+            'auto_entropy_tuning': AUTO_ENTROPY_TUNING,
+            'lr_schedule': LR_SCHEDULE,
+        },
+        'episode_rewards': [],
+        'eval_rewards': [],
+        'best_eval_reward': -float('inf'),
+        'total_steps': 0,
+        'training_time': None,
+        'architecture': 'SAC with 96-192-256 CNN and HIDDEN_SIZE=1536'
+    }
+    
+    # الاستكشاف الأولي
+    print("\n🚀 Initial exploration phase...")
+    state, _ = train_env.reset()
+    for step in range(INITIAL_EXPLORATION_STEPS):
+        action = train_env.action_space.sample()
+        next_state, reward, terminated, truncated, _ = train_env.step(action)
         done = terminated or truncated
         memory.push(state, action, reward, next_state, done)
-        state = next_state if not done else env.reset()[0]
-        total_steps += 1
-    print(f"Exploration complete: {INITIAL_EXPLORATION_STEPS:,} steps")
-
+        state = next_state if not done else train_env.reset()[0]
+        
+        if step % 1000 == 0:
+            print(f"  Exploration step: {step}/{INITIAL_EXPLORATION_STEPS}")
+    
+    print("✅ Initial exploration complete!")
+    
+    best_eval_reward = -float('inf')
+    start_time = datetime.now()
+    
+    # حلقة التدريب
     for episode in range(NUM_EPISODES):
-        state, _ = env.reset()
+        state, _ = train_env.reset()
         episode_reward = 0
         episode_steps = 0
-
+        
         for step in range(MAX_STEPS_PER_EPISODE):
+            # اختيار action
             action = agent.select_action(state)
-            next_state, reward, terminated, truncated, _ = env.step(action)
+            
+            # تنفيذ action
+            next_state, reward, terminated, truncated, _ = train_env.step(action)
             done = terminated or truncated
-
+            
+            # تخزين الانتقال
             memory.push(state, action, reward, next_state, done)
-
-            if total_steps % 4 == 0:
+            
+            # تحديث الوكيل
+            if len(memory) > BATCH_SIZE and agent.total_steps % 4 == 0:
                 update_info, _ = agent.update_parameters(memory, BATCH_SIZE)
                 if update_info:
-                    writer.add_scalar("Loss/Critic", update_info['critic_loss'], total_steps)
-                    writer.add_scalar("Loss/Actor", update_info['actor_loss'], total_steps)
-                    writer.add_scalar("Alpha", update_info['alpha'], total_steps)
-
+                    writer.add_scalar('Loss/critic', update_info['critic_loss'], agent.total_steps)
+                    writer.add_scalar('Loss/actor', update_info['actor_loss'], agent.total_steps)
+                    writer.add_scalar('Alpha', update_info['alpha'], agent.total_steps)
+            
+            # تحديث العدادات
             state = next_state
             episode_reward += reward
             episode_steps += 1
-            total_steps += 1
-            agent.total_steps = total_steps
-
+            agent.total_steps += 1
+            
             if done:
                 break
-
-        writer.add_scalar("Reward/Episode", episode_reward, episode)
-        episode_rewards.append(episode_reward)
-
-        avg_reward_100 = np.mean(episode_rewards[-100:]) if len(episode_rewards) >= 100 else np.mean(episode_rewards)
-        writer.add_scalar("Reward/Average_100", avg_reward_100, episode)
-
+        
+        # تسجيل مكافأة التدريب
+        training_results['episode_rewards'].append(episode_reward)
+        writer.add_scalar('Reward/training', episode_reward, episode)
+        writer.add_scalar('Steps/episode', episode_steps, episode)
+        
+        # تقييم دوري
+        if (episode + 1) % EVAL_FREQUENCY == 0 or episode == 0:
+            print(f"\n📊 Episode {episode + 1}/{NUM_EPISODES}")
+            print(f"   Training reward: {episode_reward:.1f}")
+            print(f"   Steps in episode: {episode_steps}")
+            print(f"   Total steps: {agent.total_steps}")
+            
+            # تقييم الوكيل
+            eval_reward, eval_episodes = agent.evaluate(eval_env, NUM_EVAL_EPISODES)
+            training_results['eval_rewards'].append({
+                'episode': episode,
+                'mean_reward': eval_reward,
+                'episode_rewards': eval_episodes.tolist()
+            })
+            
+            writer.add_scalar('Reward/evaluation', eval_reward, episode)
+            writer.add_scalar('Reward/evaluation_best', max(eval_reward, best_eval_reward), episode)
+            
+            print(f"   Evaluation ({NUM_EVAL_EPISODES} episodes): {eval_reward:.1f}")
+            print(f"   Individual episode rewards: {[f'{r:.1f}' for r in eval_episodes]}")
+            
+            # حفظ إذا كان هذا أفضل نموذج (بناءً على التقييم)
+            if eval_reward > best_eval_reward:
+                best_eval_reward = eval_reward
+                
+                # حفظ أفضل نموذج
+                best_model_path = os.path.join(CHECKPOINT_DIR, "best_model.pth")
+                agent.save_checkpoint(best_model_path, episode, eval_reward)
+                
+                # حفظ الـactor فقط للاستدلال
+                torch.save(agent.actor.state_dict(), 
+                          os.path.join(CHECKPOINT_DIR, "best_actor.pth"))
+                
+                print(f"   🎉 NEW BEST! Model saved (Eval reward: {eval_reward:.1f})")
+                
+                # التحقق إذا حققنا متطلبات الأسايمنت
+                if eval_reward > 700:
+                    print(f"   ✅ ASSIGNMENT REQUIREMENT MET! (> 700)")
+        
+        # حفظ دوري
+        if (episode + 1) % SAVE_FREQUENCY == 0:
+            checkpoint_path = os.path.join(CHECKPOINT_DIR, f"checkpoint_ep{episode+1}.pth")
+            agent.save_checkpoint(checkpoint_path, episode, 
+                                 training_results['eval_rewards'][-1]['mean_reward'] 
+                                 if training_results['eval_rewards'] else 0)
+            print(f"   💾 Checkpoint saved: {checkpoint_path}")
+        
+        # تحديث نتائج التدريب
+        training_results['total_steps'] = agent.total_steps
+        
+        # طباعة تحديث كل 10 حلقات
         if (episode + 1) % 10 == 0:
+            avg_reward_100 = np.mean(training_results['episode_rewards'][-100:]) if len(training_results['episode_rewards']) >= 100 else np.mean(training_results['episode_rewards'])
             print(f"Episode {episode + 1:4d}/{NUM_EPISODES} | "
                   f"Reward: {episode_reward:6.1f} | "
                   f"Avg(100): {avg_reward_100:6.1f} | "
                   f"Steps: {episode_steps:4d}")
-
-        if (episode + 1) % EVAL_FREQUENCY == 0:
-            if avg_reward_100 > best_reward and avg_reward_100 > 700:
-                best_reward = avg_reward_100
-                agent.save_actor_for_inference(os.path.join(CHECKPOINT_DIR, "best_model.pth"))
-                agent.save_checkpoint(os.path.join(CHECKPOINT_DIR, f"checkpoint_{episode + 1}.pth"))
-                print(f"✅ New best! Saved checkpoint (Avg: {avg_reward_100:.1f})")
-
-        if (episode + 1) % SAVE_FREQUENCY == 0:
-            agent.save_checkpoint(os.path.join(CHECKPOINT_DIR, f"checkpoint_ep{episode + 1}.pth"))
-
-    agent.save_actor_for_inference(os.path.join(CHECKPOINT_DIR, "final_model.pth"))
-    agent.save_checkpoint(os.path.join(CHECKPOINT_DIR, "final_checkpoint.pth"))
-
-    env.close()
+    
+    # انتهاء التدريب
+    end_time = datetime.now()
+    training_duration = end_time - start_time
+    training_results['training_time'] = str(training_duration)
+    training_results['best_eval_reward'] = best_eval_reward
+    
+    # حفظ النموذج النهائي
+    final_model_path = os.path.join(CHECKPOINT_DIR, "final_model.pth")
+    agent.save_checkpoint(final_model_path, NUM_EPISODES, best_eval_reward)
+    torch.save(agent.actor.state_dict(), os.path.join(CHECKPOINT_DIR, "final_actor.pth"))
+    
+    # حفظ نتائج التدريب
+    with open(RESULTS_FILE, 'w') as f:
+        json.dump(training_results, f, indent=2)
+    
+    # إغلاق البيئات
+    train_env.close()
+    eval_env.close()
     writer.close()
-
+    
+    # طباعة الملخص
     print("\n" + "=" * 70)
-    print("Training Complete!")
+    print("🏁 TRAINING COMPLETE!")
+    print("=" * 70)
     print(f"Total episodes: {NUM_EPISODES}")
-    print(f"Total steps: {total_steps:,}")
-    print(f"Best average reward (100): {best_reward:.1f}")
-    print(f"\nModels saved:")
-    print(f"  - For inference: {CHECKPOINT_DIR}/best_model.pth")
-    print(f"  - Full checkpoint: {CHECKPOINT_DIR}/final_checkpoint.pth")
-    print(f"\nTensorBoard: tensorboard --logdir=runs/car_racing_sac")
+    print(f"Total steps: {agent.total_steps:,}")
+    print(f"Training time: {training_duration}")
+    print(f"Best evaluation reward (over {NUM_EVAL_EPISODES} episodes): {best_eval_reward:.1f}")
+    
+    if best_eval_reward > 700:
+        print("✅ SUCCESS: Assignment requirement met (> 700)!")
+    else:
+        print("⚠️  WARNING: Did not meet assignment requirement (< 700)")
+    
+    print(f"\n📁 Models saved:")
+    print(f"   - Best model: {CHECKPOINT_DIR}/best_model.pth")
+    print(f"   - Best actor (for inference): {CHECKPOINT_DIR}/best_actor.pth")
+    print(f"   - Final model: {CHECKPOINT_DIR}/final_model.pth")
+    print(f"   - Training results: {RESULTS_FILE}")
+    
+    print(f"\n📊 TensorBoard logs:")
+    print(f"   tensorboard --logdir={LOG_DIR}")
     print("=" * 70)
 
 
