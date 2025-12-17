@@ -1,4 +1,8 @@
-# inference_sac.py
+"""
+inference.py - Evaluation script for CarRacing-v3 SAC agent
+EE569 Deep Learning Assignment
+"""
+
 import argparse
 import os
 import torch
@@ -7,17 +11,9 @@ import cv2
 import gymnasium as gym
 from collections import deque
 from gymnasium.wrappers import RecordVideo
+import json
 
-# Import SAC components from training script
-import sys
-sys.path.append('.')  # Ensure we can import from current directory
-
-# Device setup
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-# ============================================================================
-# WRAPPERS (Must match training)
-# ============================================================================
+# Import environment wrappers from train.py
 class CarRacingImageWrapper(gym.ObservationWrapper):
     def __init__(self, env, width=84, height=84):
         super().__init__(env)
@@ -63,7 +59,7 @@ class StackFrames(gym.Wrapper):
 
 
 class FrameSkip(gym.Wrapper):
-    def __init__(self, env, skip=3):
+    def __init__(self, env, skip=4):
         super().__init__(env)
         self._skip = skip
 
@@ -77,7 +73,7 @@ class FrameSkip(gym.Wrapper):
         return obs, total_reward, terminated, truncated, info
 
 
-def make_env(render_mode=None, skip_frames=3):
+def make_env(render_mode=None, skip_frames=4):
     env = gym.make("CarRacing-v3", continuous=True, render_mode=render_mode)
     env = FrameSkip(env, skip=skip_frames)
     env = CarRacingImageWrapper(env)
@@ -85,45 +81,32 @@ def make_env(render_mode=None, skip_frames=3):
     return env
 
 
-# ============================================================================
-# ACTOR NETWORK (Must match training)
-# ============================================================================
+# Actor Network (same as in train.py)
 class ActorNetwork(torch.nn.Module):
-    def __init__(self, state_dim, action_dim, hidden_size=1536):
+    def __init__(self, state_dim, action_dim, hidden_size=512):
         super(ActorNetwork, self).__init__()
         self.log_std_min, self.log_std_max = -20, 2
 
-        self.conv1 = torch.nn.Conv2d(state_dim[0], 96, kernel_size=5, stride=2)
-        self.conv2 = torch.nn.Conv2d(96, 192, kernel_size=3, stride=2)
-        self.conv3 = torch.nn.Conv2d(192, 256, kernel_size=3, stride=1)
+        self.conv1 = torch.nn.Conv2d(state_dim[0], 32, kernel_size=8, stride=4)
+        self.conv2 = torch.nn.Conv2d(32, 64, kernel_size=4, stride=2)
+        self.conv3 = torch.nn.Conv2d(64, 64, kernel_size=3, stride=1)
 
-        self.bn1 = torch.nn.BatchNorm2d(96)
-        self.bn2 = torch.nn.BatchNorm2d(192)
-        self.bn3 = torch.nn.BatchNorm2d(256)
+        self.bn1 = torch.nn.BatchNorm2d(32)
+        self.bn2 = torch.nn.BatchNorm2d(64)
+        self.bn3 = torch.nn.BatchNorm2d(64)
 
-        convw = lambda s, k, st: (s - (k - 1) - 1) // st + 1
-        w = convw(convw(convw(state_dim[2], 5, 2), 3, 2), 3, 1)
-        h = convw(convw(convw(state_dim[1], 5, 2), 3, 2), 3, 1)
-        linear_input_size = w * h * 256
+        def conv_output_size(size, kernel, stride):
+            return (size - (kernel - 1) - 1) // stride + 1
+        
+        w = conv_output_size(conv_output_size(conv_output_size(state_dim[2], 8, 4), 4, 2), 3, 1)
+        h = conv_output_size(conv_output_size(conv_output_size(state_dim[1], 8, 4), 4, 2), 3, 1)
+        linear_input_size = w * h * 64
 
         self.fc1 = torch.nn.Linear(linear_input_size, hidden_size)
         self.fc2 = torch.nn.Linear(hidden_size, hidden_size)
-        self.fc_residual = torch.nn.Linear(hidden_size, hidden_size)
-
-        self.ln1 = torch.nn.LayerNorm(hidden_size)
-        self.ln2 = torch.nn.LayerNorm(hidden_size)
 
         self.mean_layer = torch.nn.Linear(hidden_size, action_dim)
         self.log_std_layer = torch.nn.Linear(hidden_size, action_dim)
-
-        self._initialize_weights()
-
-    def _initialize_weights(self):
-        for module in self.modules():
-            if isinstance(module, (torch.nn.Linear, torch.nn.Conv2d)):
-                torch.nn.init.orthogonal_(module.weight, gain=0.01 if isinstance(module, torch.nn.Linear) else torch.sqrt(torch.tensor(2.0)))
-                if module.bias is not None:
-                    torch.nn.init.constant_(module.bias, 0.0)
 
     def forward(self, state):
         x = torch.nn.functional.relu(self.bn1(self.conv1(state)))
@@ -131,77 +114,73 @@ class ActorNetwork(torch.nn.Module):
         x = torch.nn.functional.relu(self.bn3(self.conv3(x)))
         x = x.view(x.size(0), -1)
 
-        x = torch.nn.functional.relu(self.ln1(self.fc1(x)))
-        residual = x
-        x = torch.nn.functional.relu(self.ln2(self.fc2(x)))
-        x = x + self.fc_residual(residual)
+        x = torch.nn.functional.relu(self.fc1(x))
+        x = torch.nn.functional.relu(self.fc2(x))
 
-        mean = torch.tanh(self.mean_layer(x)) * 1.5
+        mean = torch.tanh(self.mean_layer(x))
         log_std = self.log_std_layer(x)
         log_std = torch.clamp(log_std, self.log_std_min, self.log_std_max)
 
         return mean, log_std
 
     def get_action(self, state, deterministic=True):
-        """Get action for inference (deterministic or stochastic)"""
+        """Get action for inference"""
         with torch.no_grad():
-            mean, log_std = self.forward(state)
-            if deterministic:
-                action = torch.tanh(mean)
-            else:
-                std = log_std.exp()
-                normal = torch.distributions.Normal(mean, std)
-                z = normal.sample()
-                action = torch.tanh(z)
+            mean, _ = self.forward(state)
+            action = torch.tanh(mean)
         return action.cpu().numpy()[0]
 
 
-# ============================================================================
-# INFERENCE FUNCTIONS
-# ============================================================================
 def load_model(checkpoint_path, state_dim, action_dim, device):
-    """Load SAC actor model from checkpoint"""
+    """Load actor model from checkpoint"""
     if not os.path.exists(checkpoint_path):
-        raise FileNotFoundError(f"❌ Checkpoint not found: {checkpoint_path}")
-
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+    
     model = ActorNetwork(state_dim, action_dim).to(device)
     
-    # Try different loading methods
     try:
-        # Try loading just the state dict
+        # Try to load as state dict
         checkpoint = torch.load(checkpoint_path, map_location=device)
         
-        if isinstance(checkpoint, dict) and 'actor_state_dict' in checkpoint:
-            # Full checkpoint
-            model.load_state_dict(checkpoint['actor_state_dict'])
+        if isinstance(checkpoint, dict):
+            if 'actor_state_dict' in checkpoint:
+                # Full checkpoint
+                model.load_state_dict(checkpoint['actor_state_dict'])
+                print(f"✅ Loaded from full checkpoint (episode {checkpoint.get('episode', 'N/A')})")
+                if 'eval_reward' in checkpoint:
+                    print(f"   Evaluation reward: {checkpoint['eval_reward']:.1f}")
+            elif 'state_dict' in checkpoint:
+                # Alternative format
+                model.load_state_dict(checkpoint['state_dict'])
+            else:
+                # Assume it's already a state dict
+                model.load_state_dict(checkpoint)
         else:
-            # Actor-only checkpoint
+            # Direct state dict
             model.load_state_dict(checkpoint)
             
     except Exception as e:
-        print(f"⚠️  Warning: {e}")
-        print("Trying alternative loading method...")
-        # If there's a size mismatch, try to load with strict=False
+        print(f"⚠️ Error loading: {e}")
+        print("Trying strict=False...")
         model.load_state_dict(torch.load(checkpoint_path, map_location=device), strict=False)
     
     model.eval()
-    print(f"✅ Loaded model from: {checkpoint_path}")
     return model
 
 
-def run_episode(env, model, device, render=True, deterministic=True):
-    """Run a single episode and return total reward"""
+def run_episode(env, model, device, episode_num=0, save_video=False, video_dir="./videos"):
+    """Run a single evaluation episode"""
     state, _ = env.reset()
     total_reward = 0
     done = False
     steps = 0
     
     while not done:
-        # Prepare state tensor (add batch dimension, normalize)
+        # Prepare state tensor
         state_tensor = torch.FloatTensor(state).unsqueeze(0).to(device) / 255.0
         
-        # Get action from policy
-        action = model.get_action(state_tensor, deterministic=deterministic)
+        # Get action
+        action = model.get_action(state_tensor, deterministic=True)
         
         # Execute action
         next_state, reward, terminated, truncated, _ = env.step(action)
@@ -211,129 +190,154 @@ def run_episode(env, model, device, render=True, deterministic=True):
         state = next_state
         steps += 1
         
-        if render and hasattr(env, 'render'):
-            env.render()
+        # Early stopping if performing very poorly
+        if total_reward < -100:
+            break
         
-        # Early stopping for testing
-        if steps > 1500:  # Max steps per episode
+        # Max steps
+        if steps > 1000:
             break
     
-    return total_reward
+    return total_reward, steps
+
+
+def evaluate_model(model, device, num_episodes=3, save_video=False, video_dir="./videos"):
+    """Evaluate model for specified number of episodes"""
+    rewards = []
+    steps_list = []
+    
+    for episode in range(num_episodes):
+        # Create environment
+        render_mode = 'rgb_array' if save_video else None
+        env = make_env(render_mode=render_mode)
+        
+        # Wrap with video recorder for first episode if saving video
+        if save_video and episode == 0:
+            os.makedirs(video_dir, exist_ok=True)
+            env = RecordVideo(
+                env,
+                video_dir,
+                name_prefix=f"evaluation_episode",
+                episode_trigger=lambda x: True
+            )
+        
+        print(f"  Episode {episode + 1}/{num_episodes}...", end="")
+        reward, steps = run_episode(env, model, device, episode, save_video and episode == 0, video_dir)
+        rewards.append(reward)
+        steps_list.append(steps)
+        print(f" Reward: {reward:.1f}, Steps: {steps}")
+        
+        env.close()
+    
+    return np.array(rewards), np.array(steps_list)
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description='Load and run trained SAC on CarRacing-v3',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  python inference_sac.py --checkpoint checkpoints/best_model.pth --episodes 3
-  python inference_sac.py --checkpoint checkpoints/final_model.pth --no-render --episodes 10
-  python inference_sac.py --save-video --video-dir ./test_videos --stochastic
-        """
-    )
-    
-    parser.add_argument('--checkpoint', type=str, default='checkpoints/best_model.pth',
-                        help='Path to model checkpoint (default: checkpoints/best_model.pth)')
-    parser.add_argument('--episodes', type=int, default=5,
-                        help='Number of episodes to run (default: 5)')
-    parser.add_argument('--no-render', action='store_true',
-                        help='Disable rendering (faster)')
+    parser = argparse.ArgumentParser(description='Evaluate SAC agent on CarRacing-v3')
+    parser.add_argument('--checkpoint', type=str, default='checkpoints/best_actor.pth',
+                        help='Path to model checkpoint (default: checkpoints/best_actor.pth)')
+    parser.add_argument('--episodes', type=int, default=3,
+                        help='Number of evaluation episodes (default: 3, as per assignment)')
     parser.add_argument('--save-video', action='store_true',
-                        help='Save video recordings')
+                        help='Save video of the first evaluation episode')
     parser.add_argument('--video-dir', type=str, default='./videos',
                         help='Directory to save videos (default: ./videos)')
-    parser.add_argument('--device', type=str, default='auto', choices=['auto', 'cpu', 'cuda'],
-                        help='Device to use (default: auto)')
-    parser.add_argument('--stochastic', action='store_true',
-                        help='Use stochastic actions instead of deterministic')
-    parser.add_argument('--verbose', action='store_true',
-                        help='Print detailed information')
+    parser.add_argument('--output-file', type=str, default='evaluation_results.json',
+                        help='File to save evaluation results (default: evaluation_results.json)')
+    parser.add_argument('--device', type=str, default='auto',
+                        choices=['auto', 'cpu', 'cuda'], help='Device to use')
     
     args = parser.parse_args()
     
     # Set device
-    if args.device != 'auto':
-        global device
+    if args.device == 'auto':
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
         device = torch.device(args.device)
-    print(f"🖥️  Using device: {device}")
     
-    # Create environment
-    render_mode = 'rgb_array' if args.save_video else ('human' if not args.no_render else None)
-    env = make_env(render_mode=render_mode)
+    print("=" * 60)
+    print("CAR RACING - EVALUATION")
+    print("=" * 60)
+    print(f"Device: {device}")
+    print(f"Checkpoint: {args.checkpoint}")
+    print(f"Evaluation episodes: {args.episodes}")
+    print(f"Save video: {args.save_video}")
+    print("=" * 60)
     
-    # Wrap with video recorder if needed
-    if args.save_video:
-        os.makedirs(args.video_dir, exist_ok=True)
-        env = RecordVideo(
-            env, 
-            args.video_dir, 
-            name_prefix='sac_inference',
-            episode_trigger=lambda x: True  # Record all episodes
-        )
-        print(f"🎬 Video recording enabled, saving to: {args.video_dir}")
+    # Create a temporary environment to get dimensions
+    temp_env = make_env()
+    state_dim = temp_env.observation_space.shape
+    action_dim = temp_env.action_space.shape[0]
+    temp_env.close()
     
-    # Get environment specs
-    action_dim = env.action_space.shape[0]
-    state_dim = env.observation_space.shape
-    
-    if args.verbose:
-        print(f"\n📊 Environment Specifications:")
-        print(f"  State shape: {state_dim}")
-        print(f"  Action shape: {action_dim}")
-        print(f"  Action space: {env.action_space}")
+    print(f"State dimension: {state_dim}")
+    print(f"Action dimension: {action_dim}")
     
     # Load model
-    print(f"\n📂 Loading checkpoint: {args.checkpoint}")
+    print(f"\n📂 Loading model...")
     model = load_model(args.checkpoint, state_dim, action_dim, device)
     
-    # Run episodes
-    print(f"\n🏁 Running {args.episodes} episode(s)...")
-    print(f"  Mode: {'Stochastic' if args.stochastic else 'Deterministic'}")
-    print()
+    # Evaluate
+    print(f"\n🏁 Running evaluation ({args.episodes} episodes)...")
+    rewards, steps = evaluate_model(
+        model, device, 
+        num_episodes=args.episodes,
+        save_video=args.save_video,
+        video_dir=args.video_dir
+    )
     
-    rewards = []
+    # Calculate statistics
+    mean_reward = np.mean(rewards)
+    std_reward = np.std(rewards)
+    mean_steps = np.mean(steps)
     
-    try:
-        for episode in range(args.episodes):
-            print(f"Episode {episode + 1}/{args.episodes}...", end=" ")
-            episode_reward = run_episode(
-                env, model, device, 
-                render=(not args.no_render and not args.save_video),
-                deterministic=not args.stochastic
-            )
-            rewards.append(episode_reward)
-            print(f"Reward: {episode_reward:.2f}")
-    except KeyboardInterrupt:
-        print("\n\n⛔ Interrupted by user")
-    finally:
-        env.close()
+    # Save evaluation results
+    results = {
+        'checkpoint': args.checkpoint,
+        'num_episodes': args.episodes,
+        'rewards': rewards.tolist(),
+        'steps': steps.tolist(),
+        'mean_reward': float(mean_reward),
+        'std_reward': float(std_reward),
+        'mean_steps': float(mean_steps),
+        'device': str(device),
+        'assignment_requirement_met': mean_reward > 700
+    }
+    
+    with open(args.output_file, 'w') as f:
+        json.dump(results, f, indent=2)
     
     # Print summary
-    if rewards:
-        print("\n" + "=" * 60)
-        print("📊 PERFORMANCE SUMMARY")
-        print("=" * 60)
-        print(f"Episodes completed: {len(rewards)}")
-        print(f"Mean Reward:        {np.mean(rewards):.2f} ± {np.std(rewards):.2f}")
-        print(f"Max Reward:         {np.max(rewards):.2f}")
-        print(f"Min Reward:         {np.min(rewards):.2f}")
-        print("=" * 60)
-        
-        # Performance evaluation
-        mean_reward = np.mean(rewards)
-        if mean_reward > 800:
-            print("🎉 Excellent performance!")
-        elif mean_reward > 600:
-            print("👍 Good performance!")
-        elif mean_reward > 400:
-            print("⚠️  Average performance")
-        else:
-            print("❌ Needs improvement")
+    print("\n" + "=" * 60)
+    print("📊 EVALUATION RESULTS")
+    print("=" * 60)
+    print(f"Mean reward: {mean_reward:.1f} ± {std_reward:.1f}")
+    print(f"Individual rewards: {[f'{r:.1f}' for r in rewards]}")
+    print(f"Mean steps per episode: {mean_steps:.0f}")
+    
+    if mean_reward > 700:
+        print("✅ ASSIGNMENT REQUIREMENT MET: Mean reward > 700")
+    else:
+        print("⚠️  ASSIGNMENT REQUIREMENT NOT MET: Mean reward < 700")
+    
+    print(f"\n💾 Results saved to: {args.output_file}")
     
     if args.save_video:
-        print(f"\n🎥 Videos saved in: {args.video_dir}")
+        # Find the video file
+        video_files = [f for f in os.listdir(args.video_dir) if f.startswith("evaluation_episode")]
+        if video_files:
+            # Rename to best_run.mp4 as per assignment requirement
+            original_video = os.path.join(args.video_dir, video_files[0])
+            best_video = os.path.join(args.video_dir, "best_run.mp4")
+            
+            try:
+                os.rename(original_video, best_video)
+                print(f"🎥 Video saved as: {best_video}")
+            except:
+                print(f"🎥 Video saved in: {args.video_dir}")
+    
+    print("=" * 60)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
