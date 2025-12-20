@@ -47,11 +47,12 @@ coverage.xml
 *.cover
 .hypothesis/
 .pytest_cache/
-
+videos_test/
 # Translations
 *.mo
 *.pot
-
+logs/
+videos/
 # Django stuff:
 *.log
 local_settings.py
