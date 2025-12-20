@@ -126,7 +126,7 @@ tensorboard --logdir=logs
 ---
 
 ## 👥 Authors
-- **[Mahfoud Abdulmolla / Mu'taz Al-Harbi ]**  
+- **[Mahfoud Abdulmolla / Motaz Al-Harbi ]**  
 - EE569 Deep Learning Course  
 - **[University of Tripoli]**  
 - **[29/12/2025]**
