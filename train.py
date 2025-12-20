@@ -1,696 +1,430 @@
 import gymnasium as gym
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
+import torch.nn.functional as F
 import numpy as np
-import cv2
 import random
-from collections import deque
 import os
+import cv2
+from collections import deque
 from torch.utils.tensorboard import SummaryWriter
-import json
-from datetime import datetime
+from torch.cuda.amp import autocast, GradScaler
+import sys
 
-# ============================================================================
-# HYPERPARAMETERS
-# ============================================================================
-NUM_EPISODES = 4000
-MAX_STEPS_PER_EPISODE = 1500
-BATCH_SIZE = 768
+# Hyperparameters (Optimized for RTX 4050 - 6GB VRAM)
+NUM_EPISODES = 2000                    # Sufficient for good performance
+MAX_STEPS_PER_EPISODE = 2000          # Full lap completion
+BATCH_SIZE = 128                       # 6GB VRAM safe (was 768)
 GAMMA = 0.99
-TAU = 0.005
+TAU = 0.01                             # Softer updates (was 0.005)
 ALPHA_INIT = 0.2
-LEARNING_RATE = 8e-5
-MEMORY_SIZE = 3000000
+LEARNING_RATE = 3e-4                   # Higher for SAC (was 8e-5)
+MEMORY_SIZE = 200000                   # Reduced for 6GB (was 3M)
+HIDDEN_SIZE = 256                      # Smaller network (was 1536)
+INITIAL_EXPLORATION_STEPS = 15000      # Moderate exploration
+EXPLORATION_NOISE = 0.15               # More exploration
 
-HIDDEN_SIZE = 1536
-AUTO_ENTROPY_TUNING = True
-LR_SCHEDULE = True
 
-INITIAL_EXPLORATION_STEPS = 10000
-EXPLORATION_NOISE = 0.1
-
-EVAL_FREQUENCY = 100  
-NUM_EVAL_EPISODES = 3  
-SAVE_FREQUENCY = 100
-VIDEO_DIR = "./videos"
+# Path for checkpoints and logs
 CHECKPOINT_DIR = "./checkpoints"
 LOG_DIR = "./logs"
-RESULTS_FILE = "./training_results.json"
+VIDEO_DIR = "./videos"
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# Ensure directories exist
+os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+os.makedirs(LOG_DIR, exist_ok=True)
+os.makedirs(VIDEO_DIR, exist_ok=True)
 
-
-for dir_path in [VIDEO_DIR, CHECKPOINT_DIR, LOG_DIR]:
-    os.makedirs(dir_path, exist_ok=True)
-
-# ============================================================================
-# ENVIRONMENT WRAPPERS
-# ============================================================================
-class CarRacingImageWrapper(gym.ObservationWrapper):
-    def __init__(self, env, width=84, height=84):
-        super().__init__(env)
-        self.width = width
-        self.height = height
-        self.observation_space = gym.spaces.Box(
-            low=0, high=255, shape=(height, width), dtype=np.uint8
-        )
-        self.top_crop = 12
-        self.bottom_crop = 96
-
-    def observation(self, frame):
-        gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
-        cropped = gray[self.top_crop:self.bottom_crop, :]
-        resized = cv2.resize(cropped, (self.width, self.height),
-                             interpolation=cv2.INTER_AREA)
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        return clahe.apply(resized)
-
-
-class StackFrames(gym.Wrapper):
-    def __init__(self, env, stack_size=4):
-        super().__init__(env)
-        self.stack_size = stack_size
-        self.frames = deque(maxlen=stack_size)
-        self.observation_space = gym.spaces.Box(
-            low=0, high=255,
-            shape=(stack_size, env.observation_space.shape[0],
-                   env.observation_space.shape[1]),
-            dtype=np.uint8
-        )
-
-    def reset(self, **kwargs):
-        observation, info = self.env.reset(**kwargs)
-        for _ in range(self.stack_size):
-            self.frames.append(observation)
-        return np.stack(self.frames, axis=0), info
-
-    def step(self, action):
-        observation, reward, terminated, truncated, info = self.env.step(action)
-        self.frames.append(observation)
-        return np.stack(self.frames, axis=0), reward, terminated, truncated, info
-
-
-class FrameSkip(gym.Wrapper):
-    def __init__(self, env, skip=3):
-        super().__init__(env)
-        self._skip = skip
-
-    def step(self, action):
-        total_reward = 0.0
-        for _ in range(self._skip):
-            obs, reward, terminated, truncated, info = self.env.step(action)
-            total_reward += reward
-            if terminated or truncated:
-                break
-        return obs, total_reward, terminated, truncated, info
-
-
-def make_env(render_mode=None, skip_frames=3):
-    env = gym.make("CarRacing-v3", continuous=True, render_mode=render_mode)
-    env = FrameSkip(env, skip=skip_frames)
-    env = CarRacingImageWrapper(env)
-    env = StackFrames(env, stack_size=4)
-    return env
-
-
-# ============================================================================
-# NEURAL NETWORKS
-# ============================================================================
 class ActorNetwork(nn.Module):
-    def __init__(self, state_dim, action_dim):
+    def __init__(self, state_dim, action_dim, hidden_dim, action_limit):
         super(ActorNetwork, self).__init__()
-        self.log_std_min, self.log_std_max = -20, 2
-
-        self.conv1 = nn.Conv2d(state_dim[0], 96, kernel_size=5, stride=2)
-        self.conv2 = nn.Conv2d(96, 192, kernel_size=3, stride=2)
-        self.conv3 = nn.Conv2d(192, 256, kernel_size=3, stride=1)
-
-        self.bn1 = nn.BatchNorm2d(96)
-        self.bn2 = nn.BatchNorm2d(192)
-        self.bn3 = nn.BatchNorm2d(256)
-
-        convw = lambda s, k, st: (s - (k - 1) - 1) // st + 1
-        w = convw(convw(convw(state_dim[2], 5, 2), 3, 2), 3, 1)
-        h = convw(convw(convw(state_dim[1], 5, 2), 3, 2), 3, 1)
-        linear_input_size = w * h * 256
-
-        self.fc1 = nn.Linear(linear_input_size, HIDDEN_SIZE)
-        self.fc2 = nn.Linear(HIDDEN_SIZE, HIDDEN_SIZE)
-        self.fc_residual = nn.Linear(HIDDEN_SIZE, HIDDEN_SIZE)
-
-        self.ln1 = nn.LayerNorm(HIDDEN_SIZE)
-        self.ln2 = nn.LayerNorm(HIDDEN_SIZE)
-
-        self.mean_layer = nn.Linear(HIDDEN_SIZE, action_dim)
-        self.log_std_layer = nn.Linear(HIDDEN_SIZE, action_dim)
-
-        self._initialize_weights()
-
-    def _initialize_weights(self):
-        for module in self.modules():
-            if isinstance(module, (nn.Linear, nn.Conv2d)):
-                nn.init.orthogonal_(module.weight, gain=0.01 if isinstance(module, nn.Linear) else np.sqrt(2))
-                if module.bias is not None:
-                    nn.init.constant_(module.bias, 0.0)
+        
+        # Reduced CNN for 6GB VRAM
+        self.conv1 = nn.Conv2d(state_dim[0], 64, kernel_size=5, stride=2)   # 96->64
+        self.conv2 = nn.Conv2d(64, 128, kernel_size=3, stride=2)            # 192->128
+        self.conv3 = nn.Conv2d(128, 128, kernel_size=3, stride=1)           # 256→128
+        
+        # Calculate linear input size based on 84x84 input
+        # Conv1: (84-5)/2 + 1 = 40
+        # Conv2: (40-3)/2 + 1 = 19
+        # Conv3: (19-3)/1 + 1 = 17
+        w, h = 17, 17
+        linear_input_size = w * h * 128
+        
+        self.linear1 = nn.Linear(linear_input_size, hidden_dim)
+        self.linear2 = nn.Linear(hidden_dim, hidden_dim)
+        
+        self.mean = nn.Linear(hidden_dim, action_dim)
+        self.log_std = nn.Linear(hidden_dim, action_dim)
+        
+        self.action_limit = action_limit
 
     def forward(self, state):
-        x = F.relu(self.bn1(self.conv1(state)))
-        x = F.relu(self.bn2(self.conv2(x)))
-        x = F.relu(self.bn3(self.conv3(x)))
+        x = F.relu(self.conv1(state))
+        x = F.relu(self.conv2(x))
+        x = F.relu(self.conv3(x))
         x = x.view(x.size(0), -1)
-
-        x = F.relu(self.ln1(self.fc1(x)))
-        residual = x
-        x = F.relu(self.ln2(self.fc2(x)))
-        x = x + self.fc_residual(residual)
-
-        mean = torch.tanh(self.mean_layer(x)) * 1.5
-        log_std = self.log_std_layer(x)
-        log_std = torch.clamp(log_std, self.log_std_min, self.log_std_max)
-
+        x = F.relu(self.linear1(x))
+        x = F.relu(self.linear2(x))
+        
+        mean = self.mean(x)
+        log_std = self.log_std(x)
+        log_std = torch.clamp(log_std, min=-20, max=2)
         return mean, log_std
 
     def sample(self, state):
         mean, log_std = self.forward(state)
         std = log_std.exp()
         normal = torch.distributions.Normal(mean, std)
-
-        z = normal.rsample()
-        action = torch.tanh(z)
-
-        log_prob = normal.log_prob(z) - torch.log(1 - action.pow(2) + 1e-6)
-        log_prob = log_prob.sum(-1, keepdim=True)
-
+        x_t = normal.rsample()  # Reparameterization trick
+        y_t = torch.tanh(x_t)
+        action = y_t * self.action_limit
+        log_prob = normal.log_prob(x_t)
+        # Enforcing Action Bound
+        log_prob -= torch.log(self.action_limit * (1 - y_t.pow(2)) + 1e-6)
+        log_prob = log_prob.sum(1, keepdim=True)
         return action, log_prob
 
-
 class CriticNetwork(nn.Module):
-    def __init__(self, state_dim, action_dim):
+    def __init__(self, state_dim, action_dim, hidden_dim):
         super(CriticNetwork, self).__init__()
+        
+        # Reduced CNN for 6GB VRAM (same as Actor)
+        self.conv1 = nn.Conv2d(state_dim[0], 64, kernel_size=5, stride=2)
+        self.conv2 = nn.Conv2d(64, 128, kernel_size=3, stride=2)
+        self.conv3 = nn.Conv2d(128, 128, kernel_size=3, stride=1)
+        
+        w, h = 17, 17
+        cnn_output_size = w * h * 128
+        
+        # Q1 architecture
+        self.linear1_q1 = nn.Linear(cnn_output_size + action_dim, hidden_dim)
+        self.linear2_q1 = nn.Linear(hidden_dim, hidden_dim)
+        self.linear3_q1 = nn.Linear(hidden_dim, 1)
 
-        self.conv1 = nn.Conv2d(state_dim[0], 96, kernel_size=5, stride=2)
-        self.conv2 = nn.Conv2d(96, 192, kernel_size=3, stride=2)
-        self.conv3 = nn.Conv2d(192, 256, kernel_size=3, stride=1)
-
-        self.bn1 = nn.BatchNorm2d(96)
-        self.bn2 = nn.BatchNorm2d(192)
-        self.bn3 = nn.BatchNorm2d(256)
-
-        convw = lambda s, k, st: (s - (k - 1) - 1) // st + 1
-        w = convw(convw(convw(state_dim[2], 5, 2), 3, 2), 3, 1)
-        h = convw(convw(convw(state_dim[1], 5, 2), 3, 2), 3, 1)
-        cnn_output_size = w * h * 256
-
-        self.fc1_q1 = nn.Linear(cnn_output_size + action_dim, HIDDEN_SIZE)
-        self.fc2_q1 = nn.Linear(HIDDEN_SIZE, HIDDEN_SIZE)
-        self.fc3_q1 = nn.Linear(HIDDEN_SIZE, HIDDEN_SIZE // 2)
-        self.q1 = nn.Linear(HIDDEN_SIZE // 2, 1)
-
-        self.fc1_q2 = nn.Linear(cnn_output_size + action_dim, HIDDEN_SIZE)
-        self.fc2_q2 = nn.Linear(HIDDEN_SIZE, HIDDEN_SIZE)
-        self.fc3_q2 = nn.Linear(HIDDEN_SIZE, HIDDEN_SIZE // 2)
-        self.q2 = nn.Linear(HIDDEN_SIZE // 2, 1)
-
-        self.ln1_q1 = nn.LayerNorm(HIDDEN_SIZE)
-        self.ln2_q1 = nn.LayerNorm(HIDDEN_SIZE)
-        self.ln1_q2 = nn.LayerNorm(HIDDEN_SIZE)
-        self.ln2_q2 = nn.LayerNorm(HIDDEN_SIZE)
-
-        self._initialize_weights()
-
-    def _initialize_weights(self):
-        for module in self.modules():
-            if isinstance(module, nn.Linear):
-                nn.init.orthogonal_(module.weight, gain=1.0)
-                if module.bias is not None:
-                    nn.init.constant_(module.bias, 0.0)
+        # Q2 architecture
+        self.linear1_q2 = nn.Linear(cnn_output_size + action_dim, hidden_dim)
+        self.linear2_q2 = nn.Linear(hidden_dim, hidden_dim)
+        self.linear3_q2 = nn.Linear(hidden_dim, 1)
 
     def forward(self, state, action):
-        x = F.relu(self.bn1(self.conv1(state)))
-        x = F.relu(self.bn2(self.conv2(x)))
-        x = F.relu(self.bn3(self.conv3(x)))
+        x = F.relu(self.conv1(state))
+        x = F.relu(self.conv2(x))
+        x = F.relu(self.conv3(x))
         x = x.view(x.size(0), -1)
+        
+        xu = torch.cat([x, action], 1)
+        
+        # Q1 forward
+        x1 = F.relu(self.linear1_q1(xu))
+        x1 = F.relu(self.linear2_q1(x1))
+        x1 = self.linear3_q1(x1)
 
-        xu = torch.cat([x, action], dim=1)
+        # Q2 forward
+        x2 = F.relu(self.linear1_q2(xu))
+        x2 = F.relu(self.linear2_q2(x2))
+        x2 = self.linear3_q2(x2)
 
-        q1 = F.relu(self.ln1_q1(self.fc1_q1(xu)))
-        q1 = F.relu(self.ln2_q1(self.fc2_q1(q1)))
-        q1 = F.relu(self.fc3_q1(q1))
-        q1 = self.q1(q1)
+        return x1, x2
 
-        q2 = F.relu(self.ln1_q2(self.fc1_q2(xu)))
-        q2 = F.relu(self.ln2_q2(self.fc2_q2(q2)))
-        q2 = F.relu(self.fc3_q2(q2))
-        q2 = self.q2(q2)
-
-        return q1, q2
-
-
-class PrioritizedReplayBuffer:
-    def __init__(self, capacity, alpha=0.6, beta=0.4):
-        self.capacity = capacity
-        self.alpha = alpha
-        self.beta = beta
-        self.buffer = []
-        self.priorities = np.zeros((capacity,), dtype=np.float32)
-        self.position = 0
-        self.size = 0
+class ReplayMemory:
+    def __init__(self, capacity):
+        self.buffer = deque(maxlen=capacity)
 
     def push(self, state, action, reward, next_state, done):
-        max_priority = self.priorities.max() if self.size > 0 else 1.0
-
-        if len(self.buffer) < self.capacity:
-            self.buffer.append((state, action, reward, next_state, done))
-        else:
-            self.buffer[self.position] = (state, action, reward, next_state, done)
-
-        self.priorities[self.position] = max_priority
-        self.position = (self.position + 1) % self.capacity
-        self.size = min(self.size + 1, self.capacity)
+        self.buffer.append((state, action, reward, next_state, done))
 
     def sample(self, batch_size):
-        if self.size < batch_size:
-            return None
-
-        priorities = self.priorities[:self.size]
-        probabilities = priorities ** self.alpha
-        probabilities /= probabilities.sum()
-
-        indices = np.random.choice(self.size, batch_size, p=probabilities)
-        samples = [self.buffer[idx] for idx in indices]
-
-        total = self.size
-        weights = (total * probabilities[indices]) ** (-self.beta)
-        weights /= weights.max()
-        weights = np.array(weights, dtype=np.float32)
-
-        state, action, reward, next_state, done = zip(*samples)
-
-        return (
-            np.array(state, dtype=np.float32),
-            np.array(action, dtype=np.float32),
-            np.array(reward, dtype=np.float32),
-            np.array(next_state, dtype=np.float32),
-            np.array(done, dtype=np.float32),
-            indices,
-            weights
-        )
-
-    def update_priorities(self, indices, td_errors):
-        for idx, error in zip(indices, td_errors):
-            self.priorities[idx] = abs(error) + 1e-6
+        state, action, reward, next_state, done = zip(*random.sample(self.buffer, batch_size))
+        return np.stack(state), np.stack(action), np.stack(reward), np.stack(next_state), np.stack(done)
 
     def __len__(self):
-        return self.size
+        return len(self.buffer)
 
-
-# ============================================================================
-# SAC AGENT
-# ============================================================================
 class SACAgent:
-    def __init__(self, state_dim, action_dim):
-        self.state_dim = state_dim
-        self.action_dim = action_dim
+    def __init__(self, state_dim, action_dim, hidden_dim, action_limit, device):
+        self.device = device
+        self.action_limit = action_limit
+        self.alpha_init = ALPHA_INIT
+        
+        self.actor = ActorNetwork(state_dim, action_dim, hidden_dim, action_limit).to(device)
+        self.critic = CriticNetwork(state_dim, action_dim, hidden_dim).to(device)
+        self.target_critic = CriticNetwork(state_dim, action_dim, hidden_dim).to(device)
+        self.target_critic.load_state_dict(self.critic.state_dict())
 
-        self.actor = ActorNetwork(state_dim, action_dim).to(device)
-        self.critic = CriticNetwork(state_dim, action_dim).to(device)
-        self.critic_target = CriticNetwork(state_dim, action_dim).to(device)
-        self.critic_target.load_state_dict(self.critic.state_dict())
+        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=LEARNING_RATE)
+        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=LEARNING_RATE)
 
-        self.actor_optimizer = optim.AdamW(self.actor.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
-        self.critic_optimizer = optim.AdamW(self.critic.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
-
-        if LR_SCHEDULE:
-            self.actor_scheduler = optim.lr_scheduler.CosineAnnealingLR(
-                self.actor_optimizer, T_max=NUM_EPISODES, eta_min=1e-6
-            )
-            self.critic_scheduler = optim.lr_scheduler.CosineAnnealingLR(
-                self.critic_optimizer, T_max=NUM_EPISODES, eta_min=1e-6
-            )
-
-        if AUTO_ENTROPY_TUNING:
-            self.target_entropy = -torch.prod(torch.Tensor(action_dim).to(device)).item()
-            self.log_alpha = torch.zeros(1, requires_grad=True, device=device)
-            self.alpha = self.log_alpha.exp().detach()
-            self.alpha_optimizer = optim.Adam([self.log_alpha], lr=LEARNING_RATE)
-        else:
-            self.alpha = torch.tensor(ALPHA_INIT).to(device)
-
+        self.target_entropy = -torch.prod(torch.Tensor(action_dim).to(device)).item()
+        self.log_alpha = torch.zeros(1, requires_grad=True, device=device)
+        self.alpha_optimizer = optim.Adam([self.log_alpha], lr=LEARNING_RATE)
+        
+        # Mixed precision scalers
+        self.scaler_critic = GradScaler()
+        self.scaler_actor = GradScaler()
+        
         self.total_steps = 0
-        self.exploration_steps = INITIAL_EXPLORATION_STEPS
+
+    @property
+    def alpha(self):
+        return self.log_alpha.exp()
 
     def select_action(self, state, evaluate=False):
-        state_tensor = torch.FloatTensor(state).unsqueeze(0).to(device) / 255.0
-
-        with torch.no_grad():
-            if evaluate:
-                mean, _ = self.actor(state_tensor)
-                action = torch.tanh(mean)
-            else:
-                action, _ = self.actor.sample(state_tensor)
-                if self.total_steps < self.exploration_steps:
-                    noise = torch.randn_like(action) * EXPLORATION_NOISE
-                    action = torch.clamp(action + noise, -1.0, 1.0)
-
-        return action.cpu().numpy()[0]
+        state = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+        if evaluate:
+            mean, _ = self.actor(state)
+            return mean.cpu().data.numpy().flatten()
+        else:
+            action, _ = self.actor.sample(state)
+            return action.cpu().data.numpy().flatten()
 
     def update_parameters(self, memory, batch_size):
-        sample_result = memory.sample(batch_size)
-        if sample_result is None:
-            return None, None
+        # Sample a batch from memory
+        state_batch, action_batch, reward_batch, next_state_batch, done_batch = memory.sample(batch_size)
 
-        states, actions, rewards, next_states, dones, indices, weights = sample_result
-        weights = torch.FloatTensor(weights).to(device).unsqueeze(1)
-
-        states = torch.FloatTensor(states).to(device) / 255.0
-        actions = torch.FloatTensor(actions).to(device)
-        rewards = torch.FloatTensor(rewards).unsqueeze(1).to(device)
-        next_states = torch.FloatTensor(next_states).to(device) / 255.0
-        dones = torch.FloatTensor(dones).unsqueeze(1).to(device)
+        state_batch = torch.FloatTensor(state_batch).to(self.device)
+        next_state_batch = torch.FloatTensor(next_state_batch).to(self.device)
+        action_batch = torch.FloatTensor(action_batch).to(self.device)
+        reward_batch = torch.FloatTensor(reward_batch).to(self.device).unsqueeze(1)
+        done_batch = torch.FloatTensor(done_batch).to(self.device).unsqueeze(1)
+        
+        self.total_steps += 1
 
         with torch.no_grad():
-            next_actions, next_log_probs = self.actor.sample(next_states)
-            target_q1, target_q2 = self.critic_target(next_states, next_actions)
-            target_q = torch.min(target_q1, target_q2) - self.alpha * next_log_probs
-            target_q = rewards + (1 - dones) * GAMMA * target_q
+            next_state_action, next_state_log_pi = self.actor.sample(next_state_batch)
+            qf1_next_target, qf2_next_target = self.target_critic(next_state_batch, next_state_action)
+            min_qf_next_target = torch.min(qf1_next_target, qf2_next_target) - self.alpha * next_state_log_pi
+            next_q_value = reward_batch + (1 - done_batch) * GAMMA * min_qf_next_target
 
-        current_q1, current_q2 = self.critic(states, actions)
-        td_errors = torch.abs(current_q1 - target_q).detach().cpu().numpy().flatten()
-
-        critic_loss = (weights * F.mse_loss(current_q1, target_q, reduction='none')).mean() + \
-                      (weights * F.mse_loss(current_q2, target_q, reduction='none')).mean()
+        # Critic update with Mixed Precision
+        with autocast():
+            current_q1, current_q2 = self.critic(state_batch, action_batch)
+            qf1_loss = F.mse_loss(current_q1, next_q_value)
+            qf2_loss = F.mse_loss(current_q2, next_q_value)
+            critic_loss = qf1_loss + qf2_loss
 
         self.critic_optimizer.zero_grad()
-        critic_loss.backward()
+        self.scaler_critic.scale(critic_loss).backward()
+        self.scaler_critic.unscale_(self.critic_optimizer)
         torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)
-        self.critic_optimizer.step()
+        self.scaler_critic.step(self.critic_optimizer)
+        self.scaler_critic.update()
 
-        new_actions, log_probs = self.actor.sample(states)
-        q1, q2 = self.critic(states, new_actions)
-        q = torch.min(q1, q2)
-        actor_loss = (self.alpha * log_probs - q).mean()
+        # Actor update with Mixed Precision
+        with autocast():
+            pi, log_pi = self.actor.sample(state_batch)
+            qf1_pi, qf2_pi = self.critic(state_batch, pi)
+            min_qf_pi = torch.min(qf1_pi, qf2_pi)
+            actor_loss = ((self.alpha * log_pi) - min_qf_pi).mean()
 
         self.actor_optimizer.zero_grad()
-        actor_loss.backward()
+        self.scaler_actor.scale(actor_loss).backward()
+        self.scaler_actor.unscale_(self.actor_optimizer)
         torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
-        self.actor_optimizer.step()
+        self.scaler_actor.step(self.actor_optimizer)
+        self.scaler_actor.update()
 
-        if AUTO_ENTROPY_TUNING:
-            alpha_loss = -(self.log_alpha * (log_probs + self.target_entropy).detach()).mean()
-            self.alpha_optimizer.zero_grad()
-            alpha_loss.backward()
-            self.alpha_optimizer.step()
-            self.alpha = self.log_alpha.exp().detach()
-            alpha_loss_val = alpha_loss.item()
-        else:
-            alpha_loss_val = 0.0
+        # Alpha update
+        alpha_loss = -(self.log_alpha * (log_pi + self.target_entropy).detach()).mean()
+        self.alpha_optimizer.zero_grad()
+        alpha_loss.backward()
+        self.alpha_optimizer.step()
 
-        for target_param, param in zip(self.critic_target.parameters(), self.critic.parameters()):
-            target_param.data.copy_(TAU * param.data + (1.0 - TAU) * target_param.data)
-
-        memory.update_priorities(indices, td_errors)
-
-        if LR_SCHEDULE and self.total_steps % 1000 == 0:
-            self.actor_scheduler.step()
-            self.critic_scheduler.step()
+        # Soft update target network
+        for target_param, param in zip(self.target_critic.parameters(), self.critic.parameters()):
+            target_param.data.copy_(target_param.data * (1.0 - TAU) + param.data * TAU)
 
         return {
-            'critic_loss': critic_loss.item(),
             'actor_loss': actor_loss.item(),
-            'alpha_loss': alpha_loss_val,
-            'alpha': self.alpha.item(),
-            'td_error': td_errors.mean()
-        }, td_errors.mean()
+            'critic_loss': critic_loss.item(),
+            'alpha': self.alpha.item()
+        }, None
 
-    def evaluate(self, env, num_episodes=3):
-        """تقييم الوكيل لعدد محدد من الحلقات (كما يطلب الأسايمنت)"""
-        total_rewards = []
-        
-        for episode in range(num_episodes):
-            state, _ = env.reset()
-            episode_reward = 0
-            done = False
-            
-            while not done:
-                action = self.select_action(state, evaluate=True)
-                next_state, reward, terminated, truncated, _ = env.step(action)
-                done = terminated or truncated
-                
-                episode_reward += reward
-                state = next_state
-                
-                # إيقاف مبكر إذا كان الأداء سيئاً جداً
-                if episode_reward < -100:
-                    break
-            
-            total_rewards.append(episode_reward)
-        
-        return np.mean(total_rewards), total_rewards
-
-    def save_actor_for_inference(self, path):
-        """يحفظ فقط أوزان الـactor للاستدلال"""
-        torch.save(self.actor.state_dict(), path)
-
-    def save_checkpoint(self, path, episode, eval_reward):
-        """يحفظ الـcheckpoint الكامل"""
+    def save_checkpoint(self, filename, episode, best_reward):
         torch.save({
             'episode': episode,
             'actor_state_dict': self.actor.state_dict(),
             'critic_state_dict': self.critic.state_dict(),
-            'critic_target_state_dict': self.critic_target.state_dict(),
+            'target_critic_state_dict': self.target_critic.state_dict(),
             'actor_optimizer_state_dict': self.actor_optimizer.state_dict(),
             'critic_optimizer_state_dict': self.critic_optimizer.state_dict(),
-            'total_steps': self.total_steps,
-            'eval_reward': eval_reward,
-        }, path)
+            'alpha_optimizer_state_dict': self.alpha_optimizer.state_dict(),
+            'log_alpha': self.log_alpha,
+            'best_reward': best_reward,
+            'total_steps': self.total_steps
+        }, filename)
 
-    def load_checkpoint(self, path):
-        checkpoint = torch.load(path, map_location=device)
+    def load_checkpoint(self, filename):
+        checkpoint = torch.load(filename)
         self.actor.load_state_dict(checkpoint['actor_state_dict'])
         self.critic.load_state_dict(checkpoint['critic_state_dict'])
-        self.critic_target.load_state_dict(checkpoint['critic_target_state_dict'])
+        self.target_critic.load_state_dict(checkpoint['target_critic_state_dict'])
         self.actor_optimizer.load_state_dict(checkpoint['actor_optimizer_state_dict'])
         self.critic_optimizer.load_state_dict(checkpoint['critic_optimizer_state_dict'])
+        self.alpha_optimizer.load_state_dict(checkpoint['alpha_optimizer_state_dict'])
+        self.log_alpha = checkpoint['log_alpha']
         self.total_steps = checkpoint['total_steps']
-        return checkpoint['episode'], checkpoint.get('eval_reward', 0)
+        return checkpoint['episode'], checkpoint['best_reward']
 
+def preprocess_state(state):
+    # Convert to grayscale and resize to 84x84
+    # State shape is (96, 96, 3)
+    gray = cv2.cvtColor(state, cv2.COLOR_RGB2GRAY)
+    resized = cv2.resize(gray, (84, 84))
+    return resized / 255.0
 
-# ============================================================================
-# TRAINING WITH PROPER EVALUATION
-# ============================================================================
-def main():
-    # تهيئة TensorBoard
-    current_time = datetime.now().strftime("%Y%m%d-%H%M%S")
-    writer = SummaryWriter(f"{LOG_DIR}/sac_{current_time}")
-    
-    print("=" * 70)
-    print("CAR RACING - SAC TRAINING")
-    print("=" * 70)
-    print(f"Device: {device}")
-    print(f"Training episodes: {NUM_EPISODES}")
-    print(f"Evaluation: {NUM_EVAL_EPISODES} episodes every {EVAL_FREQUENCY} training episodes")
-    print(f"Target reward: > 700 (assignment requirement)")
-    print("=" * 70)
-    
-    # إنشاء بيئات
-    train_env = make_env()
-    eval_env = make_env()  # بيئة منفصلة للتقييم
-    
-    state_dim = train_env.observation_space.shape
-    action_dim = train_env.action_space.shape[0]
-    
-    print(f"State dimension: {state_dim}")
-    print(f"Action dimension: {action_dim}")
-    
-    # تهيئة الوكيل والذاكرة
-    agent = SACAgent(state_dim, action_dim)
-    memory = PrioritizedReplayBuffer(MEMORY_SIZE)
-    
-    # تتبع نتائج التدريب
-    training_results = {
-        'hyperparameters': {
-            'num_episodes': NUM_EPISODES,
-            'batch_size': BATCH_SIZE,
-            'learning_rate': LEARNING_RATE,
-            'gamma': GAMMA,
-            'tau': TAU,
-            'memory_size': MEMORY_SIZE,
-            'hidden_size': HIDDEN_SIZE,
-            'initial_exploration': INITIAL_EXPLORATION_STEPS,
-            'auto_entropy_tuning': AUTO_ENTROPY_TUNING,
-            'lr_schedule': LR_SCHEDULE,
-        },
-        'episode_rewards': [],
-        'eval_rewards': [],
-        'best_eval_reward': -float('inf'),
-        'total_steps': 0,
-        'training_time': None,
-        'architecture': 'SAC with 96-192-256 CNN and HIDDEN_SIZE=1536'
-    }
-    
-    # الاستكشاف الأولي
-    print("\n🚀 Initial exploration phase...")
-    state, _ = train_env.reset()
-    for step in range(INITIAL_EXPLORATION_STEPS):
-        action = train_env.action_space.sample()
-        next_state, reward, terminated, truncated, _ = train_env.step(action)
-        done = terminated or truncated
-        memory.push(state, action, reward, next_state, done)
-        state = next_state if not done else train_env.reset()[0]
-        
-        if step % 1000 == 0:
-            print(f"  Exploration step: {step}/{INITIAL_EXPLORATION_STEPS}")
-    
-    print("✅ Initial exploration complete!")
-    
-    best_eval_reward = -float('inf')
-    start_time = datetime.now()
-    
-    # حلقة التدريب
-    for episode in range(NUM_EPISODES):
-        state, _ = train_env.reset()
-        episode_reward = 0
-        episode_steps = 0
-        
-        for step in range(MAX_STEPS_PER_EPISODE):
-            # اختيار action
-            action = agent.select_action(state)
-            
-            # تنفيذ action
-            next_state, reward, terminated, truncated, _ = train_env.step(action)
-            done = terminated or truncated
-            
-            # تخزين الانتقال
-            memory.push(state, action, reward, next_state, done)
-            
-            # تحديث الوكيل
-            if len(memory) > BATCH_SIZE and agent.total_steps % 4 == 0:
-                update_info, _ = agent.update_parameters(memory, BATCH_SIZE)
-                if update_info:
-                    writer.add_scalar('Loss/critic', update_info['critic_loss'], agent.total_steps)
-                    writer.add_scalar('Loss/actor', update_info['actor_loss'], agent.total_steps)
-                    writer.add_scalar('Alpha', update_info['alpha'], agent.total_steps)
-            
-            # تحديث العدادات
-            state = next_state
-            episode_reward += reward
-            episode_steps += 1
-            agent.total_steps += 1
-            
-            if done:
-                break
-        
-        # تسجيل مكافأة التدريب
-        training_results['episode_rewards'].append(episode_reward)
-        writer.add_scalar('Reward/training', episode_reward, episode)
-        writer.add_scalar('Steps/episode', episode_steps, episode)
-        
-        # تقييم دوري
-        if (episode + 1) % EVAL_FREQUENCY == 0 or episode == 0:
-            print(f"\n📊 Episode {episode + 1}/{NUM_EPISODES}")
-            print(f"   Training reward: {episode_reward:.1f}")
-            print(f"   Steps in episode: {episode_steps}")
-            print(f"   Total steps: {agent.total_steps}")
-            
-            # تقييم الوكيل
-            eval_reward, eval_episodes = agent.evaluate(eval_env, NUM_EVAL_EPISODES)
-            training_results['eval_rewards'].append({
-                'episode': episode,
-                'mean_reward': eval_reward,
-                'episode_rewards': eval_episodes
-            })
-            
-            writer.add_scalar('Reward/evaluation', eval_reward, episode)
-            writer.add_scalar('Reward/evaluation_best', max(eval_reward, best_eval_reward), episode)
-            
-            print(f"   Evaluation ({NUM_EVAL_EPISODES} episodes): {eval_reward:.1f}")
-            print(f"   Individual episode rewards: {[f'{r:.1f}' for r in eval_episodes]}")
-            
-            # حفظ إذا كان هذا أفضل نموذج (بناءً على التقييم)
-            if eval_reward > best_eval_reward:
-                best_eval_reward = eval_reward
-                
-                # حفظ أفضل نموذج
-                best_model_path = os.path.join(CHECKPOINT_DIR, "best_model.pth")
-                agent.save_checkpoint(best_model_path, episode, eval_reward)
-                
-                # حفظ الـactor فقط للاستدلال
-                torch.save(agent.actor.state_dict(), 
-                          os.path.join(CHECKPOINT_DIR, "best_actor.pth"))
-                
-                print(f"   🎉 NEW BEST! Model saved (Eval reward: {eval_reward:.1f})")
-                
-                # التحقق إذا حققنا متطلبات الأسايمنت
-                if eval_reward > 700:
-                    print(f"   ✅ ASSIGNMENT REQUIREMENT MET! (> 700)")
-        
-        # حفظ دوري
-        if (episode + 1) % SAVE_FREQUENCY == 0:
-            checkpoint_path = os.path.join(CHECKPOINT_DIR, f"checkpoint_ep{episode+1}.pth")
-            agent.save_checkpoint(checkpoint_path, episode, 
-                                 training_results['eval_rewards'][-1]['mean_reward'] 
-                                 if training_results['eval_rewards'] else 0)
-            print(f"   💾 Checkpoint saved: {checkpoint_path}")
-        
-        # تحديث نتائج التدريب
-        training_results['total_steps'] = agent.total_steps
-        
-        # طباعة تحديث كل 10 حلقات
-        if (episode + 1) % 10 == 0:
-            avg_reward_100 = np.mean(training_results['episode_rewards'][-100:]) if len(training_results['episode_rewards']) >= 100 else np.mean(training_results['episode_rewards'])
-            print(f"Episode {episode + 1:4d}/{NUM_EPISODES} | "
-                  f"Reward: {episode_reward:6.1f} | "
-                  f"Avg(100): {avg_reward_100:6.1f} | "
-                  f"Steps: {episode_steps:4d}")
-    
-    # انتهاء التدريب
-    end_time = datetime.now()
-    training_duration = end_time - start_time
-    training_results['training_time'] = str(training_duration)
-    training_results['best_eval_reward'] = best_eval_reward
-    
-    # حفظ النموذج النهائي
-    final_model_path = os.path.join(CHECKPOINT_DIR, "final_model.pth")
-    agent.save_checkpoint(final_model_path, NUM_EPISODES, best_eval_reward)
-    torch.save(agent.actor.state_dict(), os.path.join(CHECKPOINT_DIR, "final_actor.pth"))
-    
-    # حفظ نتائج التدريب
-    with open(RESULTS_FILE, 'w') as f:
-        json.dump(training_results, f, indent=2)
-    
-    # إغلاق البيئات
-    train_env.close()
-    eval_env.close()
-    writer.close()
-    
-    # طباعة الملخص
-    print("\n" + "=" * 70)
-    print("🏁 TRAINING COMPLETE!")
-    print("=" * 70)
-    print(f"Total episodes: {NUM_EPISODES}")
-    print(f"Total steps: {agent.total_steps:,}")
-    print(f"Training time: {training_duration}")
-    print(f"Best evaluation reward (over {NUM_EVAL_EPISODES} episodes): {best_eval_reward:.1f}")
-    
-    if best_eval_reward > 700:
-        print("✅ SUCCESS: Assignment requirement met (> 700)!")
+def stack_frames(stacked_frames, state, is_new_episode):
+    frame = preprocess_state(state)
+    if is_new_episode:
+        stacked_frames = deque([frame] * 4, maxlen=4)
     else:
-        print("⚠️  WARNING: Did not meet assignment requirement (< 700)")
-    
-    print(f"\n📁 Models saved:")
-    print(f"   - Best model: {CHECKPOINT_DIR}/best_model.pth")
-    print(f"   - Best actor (for inference): {CHECKPOINT_DIR}/best_actor.pth")
-    print(f"   - Final model: {CHECKPOINT_DIR}/final_model.pth")
-    print(f"   - Training results: {RESULTS_FILE}")
-    
-    print(f"\n📊 TensorBoard logs:")
-    print(f"   tensorboard --logdir={LOG_DIR}")
-    print("=" * 70)
+        stacked_frames.append(frame)
+    return np.stack(stacked_frames, axis=0), stacked_frames
 
+def main():
+    # Detect GPU and Enable Optimizations
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    if torch.cuda.is_available():
+        # CUDA optimizations
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.cuda.empty_cache()
+        print(f"✅ CUDA optimizations enabled")
+        print(f"   GPU: {torch.cuda.get_device_name(0)}")
+        print(f"   VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+    else:
+        print("⚠️  CUDA not available. Training will be slow.")
+
+    env = gym.make("CarRacing-v3", continuous=True, render_mode="rgb_array")
+    
+    action_limit = env.action_space.high[0]
+    state_dim = (4, 84, 84)
+    action_dim = env.action_space.shape[0]
+
+    agent = SACAgent(state_dim, action_dim, HIDDEN_SIZE, action_limit, device)
+    memory = ReplayMemory(MEMORY_SIZE)
+    writer = SummaryWriter(LOG_DIR)
+    
+    # Auto-resume capability
+    LATEST_CHECKPOINT = os.path.join(CHECKPOINT_DIR, "latest.pth")
+    start_episode = 0
+    best_eval_reward = -float('inf')
+
+    if os.path.exists(LATEST_CHECKPOINT):
+        print("🔄 Found checkpoint. Resuming training...")
+        try:
+            start_episode, best_eval_reward = agent.load_checkpoint(LATEST_CHECKPOINT)
+            print(f"   Episode: {start_episode}")
+            print(f"   Best reward: {best_eval_reward:.1f}")
+            # Ensure we start from the next episode
+            start_episode += 1
+        except Exception as e:
+            print(f"⚠️  Could not load checkpoint: {e}")
+            print("🆕 Starting new training...")
+    else:
+        print("🆕 Starting new training...")
+
+    try:
+        for episode in range(start_episode, NUM_EPISODES):
+            state, _ = env.reset()
+            state, stacked_frames = stack_frames(None, state, True)
+            episode_reward = 0
+            
+            for step in range(MAX_STEPS_PER_EPISODE):
+                if agent.total_steps < INITIAL_EXPLORATION_STEPS and not os.path.exists(LATEST_CHECKPOINT):
+                    action = env.action_space.sample()
+                else:
+                    action = agent.select_action(state)
+                    # Add exploration noise
+                    action = action + np.random.normal(0, EXPLORATION_NOISE, size=action_dim)
+                    action = action.clip(env.action_space.low, env.action_space.high)
+
+                next_state, reward, terminated, truncated, _ = env.step(action)
+                done = terminated or truncated
+                
+                next_state, stacked_frames = stack_frames(stacked_frames, next_state, False)
+                
+                # Reward scaling (optional but often helpful for CarRacing)
+                # reward = reward / 10.0 
+                
+                memory.push(state, action, reward, next_state, done)
+                state = next_state
+                episode_reward += reward
+
+                # Updated frequency: Every 2 steps (for 6GB VRAM)
+                if len(memory) > BATCH_SIZE and agent.total_steps % 2 == 0:
+                    update_info, _ = agent.update_parameters(memory, BATCH_SIZE)
+                    if update_info:
+                        writer.add_scalar('Loss/critic', update_info['critic_loss'], agent.total_steps)
+                        writer.add_scalar('Loss/actor', update_info['actor_loss'], agent.total_steps)
+                        writer.add_scalar('Alpha', update_info['alpha'], agent.total_steps)
+
+                if done:
+                    break
+
+            writer.add_scalar('Reward/train', episode_reward, episode)
+            print(f"Episode {episode}/{NUM_EPISODES}, Reward: {episode_reward:.1f}, Steps: {step}")
+            
+            # Optional Memory Monitoring
+            if episode % 10 == 0 and torch.cuda.is_available():
+                allocated = torch.cuda.memory_allocated() / 1e9
+                reserved = torch.cuda.memory_reserved() / 1e9
+                print(f"   VRAM: {allocated:.2f}GB / {reserved:.2f}GB")
+
+            # Save latest checkpoint after each episode
+            agent.save_checkpoint(LATEST_CHECKPOINT, episode, best_eval_reward)
+
+            # Evaluation and Best Checkpoint Saving (every 20 episodes)
+            if episode % 20 == 0:
+                avg_reward = 0
+                eval_episodes = 3 # Small eval to save time
+                
+                # Create evaluation environment with video recording
+                eval_env = gym.make("CarRacing-v3", continuous=True, render_mode="rgb_array")
+                eval_env = gym.wrappers.RecordVideo(
+                    eval_env, 
+                    video_folder=VIDEO_DIR, 
+                    episode_trigger=lambda x: True, # Record all eval episodes
+                    name_prefix=f"eval_ep_{episode}"
+                )
+
+                for _ in range(eval_episodes):
+                    eval_state, _ = eval_env.reset()
+                    eval_state, eval_frames = stack_frames(None, eval_state, True)
+                    eval_reward = 0
+                    while True:
+                        eval_action = agent.select_action(eval_state, evaluate=True)
+                        eval_next_state, r, term, trunc, _ = eval_env.step(eval_action)
+                        eval_next_state, eval_frames = stack_frames(eval_frames, eval_next_state, False)
+                        eval_reward += r
+                        eval_state = eval_next_state
+                        if term or trunc:
+                            break
+                    avg_reward += eval_reward
+                
+                eval_env.close() # Close to save video
+                
+                avg_reward /= eval_episodes
+                writer.add_scalar('Reward/eval', avg_reward, episode)
+                print(f"⭐ Evaluation: {avg_reward:.1f} (Video saved to {VIDEO_DIR})")
+                
+                if avg_reward > best_eval_reward:
+                    best_eval_reward = avg_reward
+                    agent.save_checkpoint(os.path.join(CHECKPOINT_DIR, "best_model.pth"), episode, best_eval_reward)
+                    print(f"🏆 New best model saved!")
+
+    except KeyboardInterrupt:
+        print("\n⏸️  Training interrupted!")
+        print("Saving checkpoint...")
+        agent.save_checkpoint(LATEST_CHECKPOINT, episode, best_eval_reward)
+        print(f"✅ Saved: {LATEST_CHECKPOINT}")
+        sys.exit(0)
+    finally:
+        env.close()
+        writer.close()
 
 if __name__ == "__main__":
     main()
-
-

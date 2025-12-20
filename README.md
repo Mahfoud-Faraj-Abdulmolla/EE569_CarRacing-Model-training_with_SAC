@@ -1,132 +1,81 @@
-# EE569 CarRacing-v3: SAC Implementation for Autonomous Racing
-
-## 📋 Project Overview
-This repository contains a complete implementation of **Soft Actor-Critic (SAC)** for the **CarRacing-v3** environment from Gymnasium.  
-The agent learns autonomous driving directly from **raw pixel inputs (84×84 grayscale frames)** using deep reinforcement learning.
-
-- **Course:** EE569 Deep Learning  
-- **Assignment:** CarRacing-v3 RL Challenge  
-- **Algorithm:** Soft Actor-Critic (SAC)  
-- **Status:** ✅ Requirements met (>700 average reward)
-
----
-
-## 🏎️ Performance
-- **Best Evaluation Score:** *[Insert your score here]* (average over 3 episodes)  
-- **Target Requirement:** >700 (Achieved)  
-- **Training Episodes:** 4000  
-- **Total Environment Steps:** *[Insert steps here]*  
-
----
-
 ## 🚀 Quick Start
 
-### Installation
+### 1. Setup
 ```bash
-# Clone repository
-git clone https://github.com/[your-username]/EE569_CarRacing-Model-training_with_SAC.git
-cd EE569_CarRacing-Model-training_with_SAC
+# 1. Create virtual environment with Python 3.12
+# (Requires python 3.12 to be installed on your system)
+uv venv --python 3.12
 
-# Install dependencies
-pip install -r requirements.txt
+# 2. Activate environment
+source .venv/bin/activate
+
+# 3. Install dependencies
+# 'swig' is required for Box2D
+uv pip install swig
+uv pip install -r requirements.txt
 ```
 
-### Training
+### 2. Verify Setup
 ```bash
+python test_setup.py
+```
+
+### 3. Train
+```bash
+./run_training.sh
+# OR
 python train.py
 ```
 
-### Evaluation
+## ⏸️ Pause & Resume
+
+- **Pause:** Ctrl+C (auto-saves checkpoint)
+- **Resume:** Run `python train.py` again
+
+## 📊 Monitor Progress
+
 ```bash
-# Evaluate best model (3 episodes)
-python inference.py --checkpoint checkpoints/best_actor.pth --episodes 3
+# Terminal 1: Training
+python train.py
 
-# Record evaluation video (best_run.mp4)
-python inference.py --checkpoint checkpoints/best_actor.pth --episodes 3 --save-video
-```
-
----
-
-## 📁 Project Structure
-```
-EE569_CarRacing-Model-training_with_SAC/
-├── train.py               # Main training script
-├── inference.py           # Evaluation and video recording
-├── requirements.txt       # Dependency specifications
-├── checkpoints/           # Saved model weights
-├── videos/                # Recorded videos
-├── logs/                  # TensorBoard logs
-├── training_results.json  # Training metrics
-└── README.md              # This file
-```
-
----
-
-## 🧠 Model Architecture
-
-### Network Design
-- **Input:** 4 × 84 × 84 grayscale stacked frames  
-- **CNN Encoder:** 96 → 192 → 256 channels with BatchNorm  
-- **Actor Network:** Gaussian policy with automatic entropy tuning  
-- **Critic Networks:** Twin Q-networks for stable learning  
-- **Hidden Size:** 1536 fully-connected units  
-
----
-
-## ⚙️ Hyperparameters
-
-| Parameter        | Value | Description                     |
-|------------------|-------|---------------------------------|
-| Learning Rate     | 8e-5  | AdamW optimizer                 |
-| Batch Size        | 768   | Training batch size             |
-| Discount (γ)      | 0.99  | Future reward discount          |
-| Target Update (τ) | 0.005 | Soft target update              |
-| Memory Size       | 3M    | Replay buffer capacity          |
-
----
-
-## 📊 Results & Visualization
-
-### Training Metrics (TensorBoard)
-```bash
+# Terminal 2: TensorBoard
 tensorboard --logdir=logs
 ```
 
----
+Open: `http://localhost:6006`
 
-## 📝 Assignment Requirements Checklist
+## 🔧 RTX 4050 Optimizations
 
-| Requirement               | Status | Notes                        |
-|---------------------------|--------|------------------------------|
-| Pixel input (84×84)       | ✅     | Grayscale with stacking      |
-| >700 average reward       | ✅     | Achieved                     |
-| 3-episode evaluation      | ✅     | Proper evaluation protocol   |
-| Video recording           | ✅     | best_run.mp4 generated       |
-| TensorBoard logging       | ✅     | Comprehensive metrics        |
-| Clean, modular code       | ✅     | Well-structured implementation |
+- ✅ Batch size: 128 (VRAM-safe)
+- ✅ Hidden size: 256 (efficient)
+- ✅ Mixed precision training
+- ✅ Smaller CNN (64→128→128)
+- ✅ Memory buffer: 200k
+- ✅ Auto-resume capability
 
----
+## 📈 Expected Performance
 
-## 🔬 Technical Highlights
+- **Training time:** 24-30 hours (2000 episodes)
+- **Target reward:** 750-850+
+- **VRAM usage:** ~4-5 GB peak
 
-### Advanced Features
-- **Prioritized Experience Replay** – Efficient sample utilization  
-- **Automatic Entropy Tuning** – Adaptive exploration–exploitation  
-- **Cosine Annealing LR** – Smooth learning rate decay  
-- **Frame Stacking** – Temporal information preservation  
-- **Image Enhancement (CLAHE)** – Improved feature extraction  
+## 📁 Structure
 
----
+```
+├── train.py           # Main training
+├── inference.py       # Run trained model
+├── test_setup.py      # Verify setup
+├── run_training.sh    # Start script
+├── checkpoints/       # Model saves
+├── videos/           # Evaluation videos
+└── logs/             # TensorBoard
+```
 
-## 📚 References
-- Haarnoja et al. (2018). *Soft Actor-Critic: Off-Policy Maximum Entropy Deep Reinforcement Learning with a Stochastic Actor*  
-- Brockman et al. (2016). *OpenAI Gym*  
-- EE569 Deep Learning Course Materials  
+## ⚠️ Troubleshooting
 
----
-
-## 👥 Authors
-- **[Mahfoud Abdulmolla / Mu'taz Al-Harbi ]**  
-- EE569 Deep Learning Course  
-- **[University of Tripoli]**  
-- **[29/12/2025]**
+**Out of Memory:**
+```python
+# In train.py, reduce:
+BATCH_SIZE = 64        # Down from 128
+MEMORY_SIZE = 100000   # Down from 200000
+```
