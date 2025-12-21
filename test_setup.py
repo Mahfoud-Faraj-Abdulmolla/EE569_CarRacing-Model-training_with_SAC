@@ -1,4 +1,3 @@
-"""Test script for RTX 4050 (6GB VRAM) setup"""
 import torch
 import gymnasium as gym
 import os

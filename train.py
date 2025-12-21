@@ -9,21 +9,22 @@ import os
 import cv2
 from collections import deque
 from torch.utils.tensorboard import SummaryWriter
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 import sys
 
-# Hyperparameters (Optimized for RTX 4050 - 6GB VRAM)
-NUM_EPISODES = 2000                    # Sufficient for good performance
-MAX_STEPS_PER_EPISODE = 2000          # Full lap completion
-BATCH_SIZE = 128                       # 6GB VRAM safe (was 768)
+# Hyperparameters (MAXED OUT for RTX 4050 - 6GB VRAM, 16GB RAM)
+# For RTX 5060 Ti (16GB VRAM, 32GB RAM), see README.md for recommended values
+NUM_EPISODES = 2000                    # Full training run
+MAX_STEPS_PER_EPISODE = 2000           # Full lap completion
+BATCH_SIZE = 1280                      # MAXED: Target ~85% VRAM (was using 74% at 1024)
 GAMMA = 0.99
-TAU = 0.01                             # Softer updates (was 0.005)
+TAU = 0.01                             # Soft target updates
 ALPHA_INIT = 0.2
-LEARNING_RATE = 3e-4                   # Higher for SAC (was 8e-5)
-MEMORY_SIZE = 200000                   # Reduced for 6GB (was 3M)
-HIDDEN_SIZE = 256                      # Smaller network (was 1536)
-INITIAL_EXPLORATION_STEPS = 15000      # Moderate exploration
-EXPLORATION_NOISE = 0.15               # More exploration
+LEARNING_RATE = 3e-4                   # Standard SAC learning rate
+MEMORY_SIZE = 500000                   # MAXED: Target ~80% RAM (was using 50% at 350k)
+HIDDEN_SIZE = 512                      # MAXED: Better network capacity
+INITIAL_EXPLORATION_STEPS = 20000      # Exploration before policy training
+EXPLORATION_NOISE = 0.15               # Action noise for exploration
 
 
 # Path for checkpoints and logs
@@ -40,7 +41,7 @@ class ActorNetwork(nn.Module):
     def __init__(self, state_dim, action_dim, hidden_dim, action_limit):
         super(ActorNetwork, self).__init__()
         
-        # Reduced CNN for 6GB VRAM
+        # Efficient CNN for 16GB VRAM
         self.conv1 = nn.Conv2d(state_dim[0], 64, kernel_size=5, stride=2)   # 96->64
         self.conv2 = nn.Conv2d(64, 128, kernel_size=3, stride=2)            # 192->128
         self.conv3 = nn.Conv2d(128, 128, kernel_size=3, stride=1)           # 256→128
@@ -90,7 +91,7 @@ class CriticNetwork(nn.Module):
     def __init__(self, state_dim, action_dim, hidden_dim):
         super(CriticNetwork, self).__init__()
         
-        # Reduced CNN for 6GB VRAM (same as Actor)
+        # Efficient CNN for 16GB VRAM (same as Actor)
         self.conv1 = nn.Conv2d(state_dim[0], 64, kernel_size=5, stride=2)
         self.conv2 = nn.Conv2d(64, 128, kernel_size=3, stride=2)
         self.conv3 = nn.Conv2d(128, 128, kernel_size=3, stride=1)
@@ -161,8 +162,8 @@ class SACAgent:
         self.alpha_optimizer = optim.Adam([self.log_alpha], lr=LEARNING_RATE)
         
         # Mixed precision scalers
-        self.scaler_critic = GradScaler()
-        self.scaler_actor = GradScaler()
+        self.scaler_critic = GradScaler('cuda')
+        self.scaler_actor = GradScaler('cuda')
         
         self.total_steps = 0
 
@@ -198,7 +199,7 @@ class SACAgent:
             next_q_value = reward_batch + (1 - done_batch) * GAMMA * min_qf_next_target
 
         # Critic update with Mixed Precision
-        with autocast():
+        with autocast('cuda'):
             current_q1, current_q2 = self.critic(state_batch, action_batch)
             qf1_loss = F.mse_loss(current_q1, next_q_value)
             qf2_loss = F.mse_loss(current_q2, next_q_value)
@@ -212,7 +213,7 @@ class SACAgent:
         self.scaler_critic.update()
 
         # Actor update with Mixed Precision
-        with autocast():
+        with autocast('cuda'):
             pi, log_pi = self.actor.sample(state_batch)
             qf1_pi, qf2_pi = self.critic(state_batch, pi)
             min_qf_pi = torch.min(qf1_pi, qf2_pi)
@@ -354,13 +355,14 @@ def main():
                 state = next_state
                 episode_reward += reward
 
-                # Updated frequency: Every 2 steps (for 6GB VRAM)
+                # Updated frequency: Every 2 steps + double gradient updates
                 if len(memory) > BATCH_SIZE and agent.total_steps % 2 == 0:
-                    update_info, _ = agent.update_parameters(memory, BATCH_SIZE)
-                    if update_info:
-                        writer.add_scalar('Loss/critic', update_info['critic_loss'], agent.total_steps)
-                        writer.add_scalar('Loss/actor', update_info['actor_loss'], agent.total_steps)
-                        writer.add_scalar('Alpha', update_info['alpha'], agent.total_steps)
+                    for _ in range(2):  # Double gradient updates for faster learning
+                        update_info, _ = agent.update_parameters(memory, BATCH_SIZE)
+                        if update_info:
+                            writer.add_scalar('Loss/critic', update_info['critic_loss'], agent.total_steps)
+                            writer.add_scalar('Loss/actor', update_info['actor_loss'], agent.total_steps)
+                            writer.add_scalar('Alpha', update_info['alpha'], agent.total_steps)
 
                 if done:
                     break
