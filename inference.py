@@ -14,7 +14,6 @@ from gymnasium.wrappers import RecordVideo
 import json
 
 
-# نفس الـwrappers المستخدمة في التدريب
 class CarRacingImageWrapper(gym.ObservationWrapper):
     def __init__(self, env, width=84, height=84):
         super().__init__(env)
@@ -145,11 +144,10 @@ def load_model(checkpoint_path, state_dim, action_dim, device):
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
 
-    # أنشئ النموذج بالبنية الصحيحة (1536 hidden size كما في train.py)
     model = ActorNetwork(state_dim, action_dim, hidden_size=1536).to(device)
 
     try:
-        # حاول تحميل checkpoint
+        # حاول تحميل 
         checkpoint = torch.load(checkpoint_path, map_location=device,weights_only=True)
 
         # تحقق من نوع الـcheckpoint
@@ -181,7 +179,6 @@ def load_model(checkpoint_path, state_dim, action_dim, device):
         except Exception as e2:
             print(f"❌ Failed to load even with strict=False: {e2}")
             print("Creating empty model...")
-            # إذا فشل كل شيء، استخدم النموذج الجديد (مع أوزان عشوائية)
             model = ActorNetwork(state_dim, action_dim, hidden_size=1536).to(device)
 
     model.eval()
