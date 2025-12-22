@@ -18,16 +18,16 @@ import warnings
 warnings.filterwarnings("ignore")
 
 # Hyperparameters (Optimized for RTX 4050 - 6GB VRAM, 16GB RAM)
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True" # Help with fragmentation
+os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True" # Help with fragmentation
 NUM_EPISODES = 3000                    # Longer training
-MAX_STEPS_PER_EPISODE = 2000           # Full lap completion
-BATCH_SIZE = 128                       # Reduced to 128 to prevent CUDA OOM on 6GB VRAM
+MAX_STEPS_PER_EPISODE = 1500           # Full lap completion
+BATCH_SIZE = 300                       # Reduced to 128 to prevent CUDA OOM on 6GB VRAM
 GAMMA = 0.99
 TAU = 0.01                             # Soft target updates
 ALPHA_INIT = 0.2
 LEARNING_RATE = 3e-4                   # Standard SAC learning rate
-MEMORY_SIZE = 150000                   # Reduced to ~150k (approx 8.5GB) to fit in 16GB RAM
-HIDDEN_SIZE = 256                      # Reduced to 256 to save VRAM and compute
+MEMORY_SIZE = 300000                   # Reduced to ~150k (approx 8.5GB) to fit in 16GB RAM
+HIDDEN_SIZE = 512                      # Reduced to 256 to save VRAM and compute
 INITIAL_EXPLORATION_STEPS = 20000      # Exploration before policy training
 EXPLORATION_NOISE = 0.15               # Action noise for exploration
 ACTION_REPEAT = 2                      # Frame skipping (2 for fine steering control)
@@ -308,8 +308,8 @@ class SACAgent:
             'alpha': self.alpha.item()
         }, None
 
-    def save_checkpoint(self, filename, episode, best_reward):
-        torch.save({
+    def save_checkpoint(self, filename, episode, best_reward, memory=None):
+        checkpoint = {
             'episode': episode,
             'actor_state_dict': self.actor.state_dict(),
             'critic_state_dict': self.critic.state_dict(),
@@ -319,19 +319,42 @@ class SACAgent:
             'alpha_optimizer_state_dict': self.alpha_optimizer.state_dict(),
             'log_alpha': self.log_alpha,
             'best_reward': best_reward,
-            'total_steps': self.total_steps
-        }, filename)
+            'total_steps': self.total_steps,
+            'rng_state_torch': torch.get_rng_state(),
+            'rng_state_numpy': np.random.get_state(),
+            'rng_state_random': random.getstate()
+        }
+        if torch.cuda.is_available():
+            checkpoint['rng_state_cuda'] = torch.cuda.get_rng_state()
+            
+        if memory is not None:
+            checkpoint['replay_buffer'] = memory.buffer
+            # print(f"   Saved replay buffer with {len(memory)} samples") # Optional: Uncomment for debug
+        torch.save(checkpoint, filename)
 
-    def load_checkpoint(self, filename):
+    def load_checkpoint(self, filename, memory=None):
         checkpoint = torch.load(filename)
         self.actor.load_state_dict(checkpoint['actor_state_dict'])
         self.critic.load_state_dict(checkpoint['critic_state_dict'])
         self.target_critic.load_state_dict(checkpoint['target_critic_state_dict'])
         self.actor_optimizer.load_state_dict(checkpoint['actor_optimizer_state_dict'])
         self.critic_optimizer.load_state_dict(checkpoint['critic_optimizer_state_dict'])
-        self.alpha_optimizer.load_state_dict(checkpoint['alpha_optimizer.state_dict'])
+        self.alpha_optimizer.load_state_dict(checkpoint['alpha_optimizer_state_dict'])
         self.log_alpha = checkpoint['log_alpha']
         self.total_steps = checkpoint['total_steps']
+        
+        # Load RNG states
+        if 'rng_state_torch' in checkpoint:
+            torch.set_rng_state(checkpoint['rng_state_torch'])
+            np.random.set_state(checkpoint['rng_state_numpy'])
+            random.setstate(checkpoint['rng_state_random'])
+            if torch.cuda.is_available() and 'rng_state_cuda' in checkpoint:
+                torch.cuda.set_rng_state(checkpoint['rng_state_cuda'])
+        
+        if memory is not None and 'replay_buffer' in checkpoint:
+            memory.buffer = checkpoint['replay_buffer']
+            print(f"   Loaded replay buffer with {len(memory)} samples")
+            
         return checkpoint['episode'], checkpoint['best_reward']
 
 
@@ -351,6 +374,17 @@ def stack_frames(stacked_frames, state, is_new_episode):
     else:
         stacked_frames.append(frame)
     return np.stack(stacked_frames, axis=0), stacked_frames
+
+
+def set_seed(seed, env=None):
+    """Set seed for reproducibility."""
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    if env:
+        env.action_space.seed(seed)
 
 
 def main():
@@ -374,6 +408,11 @@ def main():
     print(f"🔄 Action Repeat: {ACTION_REPEAT}")
     print(f"🧠 Optimized RAM: storing uint8 frames")
 
+    # Set Seed
+    SEED = 42
+    print(f"🌱 Setting random seed to {SEED}")
+    set_seed(SEED)
+
     env = gym.make("CarRacing-v3", continuous=True, render_mode="rgb_array")
     
     action_limit = env.action_space.high[0]
@@ -392,7 +431,7 @@ def main():
     if os.path.exists(LATEST_CHECKPOINT):
         print("🔄 Found checkpoint. Resuming training...")
         try:
-            start_episode, best_eval_reward = agent.load_checkpoint(LATEST_CHECKPOINT)
+            start_episode, best_eval_reward = agent.load_checkpoint(LATEST_CHECKPOINT, memory)
             print(f"   Episode: {start_episode}")
             print(f"   Best reward: {best_eval_reward:.1f}")
             # Ensure we start from the next episode
@@ -405,7 +444,7 @@ def main():
 
     try:
         for episode in range(start_episode, NUM_EPISODES):
-            state, _ = env.reset()
+            state, _ = env.reset(seed=SEED + episode)
             state, stacked_frames = stack_frames(None, state, True)
             episode_reward = 0
             
@@ -455,10 +494,10 @@ def main():
                 print(f"   VRAM: {allocated:.2f}GB / {reserved:.2f}GB")
 
             # Save latest checkpoint after each episode
-            agent.save_checkpoint(LATEST_CHECKPOINT, episode, best_eval_reward)
+            agent.save_checkpoint(LATEST_CHECKPOINT, episode, best_eval_reward, memory)
 
-            # Evaluation and Best Checkpoint Saving (every 20 episodes)
-            if episode % 20 == 0:
+            # Evaluation and Best Checkpoint Saving (every 10 episodes)
+            if episode % 10 == 0:
                 avg_reward = 0
                 eval_episodes = 3 # Small eval to save time
                 
@@ -493,13 +532,13 @@ def main():
                 
                 if avg_reward > best_eval_reward:
                     best_eval_reward = avg_reward
-                    agent.save_checkpoint(os.path.join(CHECKPOINT_DIR, "best_model.pth"), episode, best_eval_reward)
+                    agent.save_checkpoint(os.path.join(CHECKPOINT_DIR, "best_model.pth"), episode, best_eval_reward, memory)
                     print(f"🏆 New best model saved!")
 
     except KeyboardInterrupt:
         print("\n⏸️  Training interrupted!")
         print("Saving checkpoint...")
-        agent.save_checkpoint(LATEST_CHECKPOINT, episode, best_eval_reward)
+        agent.save_checkpoint(LATEST_CHECKPOINT, episode, best_eval_reward, memory)
         print(f"✅ Saved: {LATEST_CHECKPOINT}")
         sys.exit(0)
     finally:
