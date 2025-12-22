@@ -10,21 +10,27 @@ import cv2
 from collections import deque
 from torch.utils.tensorboard import SummaryWriter
 from torch.amp import autocast, GradScaler
+import kornia.augmentation as K
 import sys
+import warnings
 
-# Hyperparameters (MAXED OUT for RTX 4050 - 6GB VRAM, 16GB RAM)
-# For RTX 5060 Ti (16GB VRAM, 32GB RAM), see README.md for recommended values
-NUM_EPISODES = 2000                    # Full training run
-MAX_STEPS_PER_EPISODE = 2000           # Full lap completion
-BATCH_SIZE = 1280                      # MAXED: Target ~85% VRAM (was using 74% at 1024)
+# Suppress warnings (e.g. from pygame/pkg_resources)
+warnings.filterwarnings("ignore")
+
+# Hyperparameters (Optimized for RTX 4050 - 6GB VRAM, 16GB RAM)
+os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True" # Help with fragmentation
+NUM_EPISODES = 3000                    # Longer training
+MAX_STEPS_PER_EPISODE = 1500           # Full lap completion
+BATCH_SIZE = 300                       # Reduced to 128 to prevent CUDA OOM on 6GB VRAM
 GAMMA = 0.99
 TAU = 0.01                             # Soft target updates
 ALPHA_INIT = 0.2
 LEARNING_RATE = 3e-4                   # Standard SAC learning rate
-MEMORY_SIZE = 500000                   # MAXED: Target ~80% RAM (was using 50% at 350k)
-HIDDEN_SIZE = 512                      # MAXED: Better network capacity
+MEMORY_SIZE = 300000                   # Reduced to ~150k (approx 8.5GB) to fit in 16GB RAM
+HIDDEN_SIZE = 512                      # Reduced to 256 to save VRAM and compute
 INITIAL_EXPLORATION_STEPS = 20000      # Exploration before policy training
 EXPLORATION_NOISE = 0.15               # Action noise for exploration
+ACTION_REPEAT = 2                      # Frame skipping (2 for fine steering control)
 
 
 # Path for checkpoints and logs
@@ -37,41 +43,76 @@ os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 os.makedirs(LOG_DIR, exist_ok=True)
 os.makedirs(VIDEO_DIR, exist_ok=True)
 
+
+class ResidualBlock(nn.Module):
+    """Residual block with GroupNorm for SAC stability (not BatchNorm!)."""
+    def __init__(self, in_channels, out_channels, stride=1):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, 3, stride=stride, padding=1)
+        self.gn1 = nn.GroupNorm(min(8, out_channels // 4), out_channels)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, 3, padding=1)
+        self.gn2 = nn.GroupNorm(min(8, out_channels // 4), out_channels)
+        
+        # Skip connection with projection if dimensions change
+        if stride != 1 or in_channels != out_channels:
+            self.skip = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, 1, stride=stride),
+                nn.GroupNorm(min(8, out_channels // 4), out_channels)
+            )
+        else:
+            self.skip = nn.Identity()
+    
+    def forward(self, x):
+        residual = self.skip(x)
+        out = F.relu(self.gn1(self.conv1(x)))
+        out = self.gn2(self.conv2(out))
+        return F.relu(out + residual)
+
+
 class ActorNetwork(nn.Module):
+    """Actor with D2RL dense connections and residual blocks."""
     def __init__(self, state_dim, action_dim, hidden_dim, action_limit):
-        super(ActorNetwork, self).__init__()
+        super().__init__()
         
-        # Efficient CNN for 16GB VRAM
-        self.conv1 = nn.Conv2d(state_dim[0], 64, kernel_size=5, stride=2)   # 96->64
-        self.conv2 = nn.Conv2d(64, 128, kernel_size=3, stride=2)            # 192->128
-        self.conv3 = nn.Conv2d(128, 128, kernel_size=3, stride=1)           # 256→128
+        # 3 residual blocks with GroupNorm
+        self.res1 = ResidualBlock(4, 64, stride=2)    # 84 -> 42
+        self.res2 = ResidualBlock(64, 128, stride=2)  # 42 -> 21
+        self.res3 = ResidualBlock(128, 256, stride=2) # 21 -> 11
         
-        # Calculate linear input size based on 84x84 input
-        # Conv1: (84-5)/2 + 1 = 40
-        # Conv2: (40-3)/2 + 1 = 19
-        # Conv3: (19-3)/1 + 1 = 17
-        w, h = 17, 17
-        linear_input_size = w * h * 128
+        # Adaptive pooling to 6x6 for consistent feature size
+        self.adaptive_pool = nn.AdaptiveAvgPool2d((6, 6))
         
-        self.linear1 = nn.Linear(linear_input_size, hidden_dim)
-        self.linear2 = nn.Linear(hidden_dim, hidden_dim)
+        # Dense features: (64 + 128 + 256) * 36 = 16,128
+        dense_size = (64 + 128 + 256) * 36
+        
+        # MLP with D2RL skip connection
+        self.fc1 = nn.Linear(dense_size, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim + dense_size, hidden_dim)
         
         self.mean = nn.Linear(hidden_dim, action_dim)
         self.log_std = nn.Linear(hidden_dim, action_dim)
-        
         self.action_limit = action_limit
 
     def forward(self, state):
-        x = F.relu(self.conv1(state))
-        x = F.relu(self.conv2(x))
-        x = F.relu(self.conv3(x))
-        x = x.view(x.size(0), -1)
-        x = F.relu(self.linear1(x))
-        x = F.relu(self.linear2(x))
+        # Feature extraction with dense collection
+        f1 = self.res1(state)   # 64 x 42 x 42
+        f2 = self.res2(f1)      # 128 x 21 x 21
+        f3 = self.res3(f2)      # 256 x 11 x 11
+        
+        # Pool all features to same size for dense concatenation
+        p1 = self.adaptive_pool(f1).flatten(1)  # 64 * 36 = 2304
+        p2 = self.adaptive_pool(f2).flatten(1)  # 128 * 36 = 4608
+        p3 = self.adaptive_pool(f3).flatten(1)  # 256 * 36 = 9216
+        
+        # D2RL dense concatenation
+        features = torch.cat([p1, p2, p3], dim=1)  # 16128
+        
+        # MLP with skip connection
+        x = F.relu(self.fc1(features))
+        x = F.relu(self.fc2(torch.cat([x, features], dim=1)))
         
         mean = self.mean(x)
-        log_std = self.log_std(x)
-        log_std = torch.clamp(log_std, min=-20, max=2)
+        log_std = torch.clamp(self.log_std(x), -20, 2)
         return mean, log_std
 
     def sample(self, state):
@@ -87,47 +128,56 @@ class ActorNetwork(nn.Module):
         log_prob = log_prob.sum(1, keepdim=True)
         return action, log_prob
 
+
 class CriticNetwork(nn.Module):
+    """Twin Q-Critic with D2RL dense connections and residual blocks."""
     def __init__(self, state_dim, action_dim, hidden_dim):
-        super(CriticNetwork, self).__init__()
+        super().__init__()
         
-        # Efficient CNN for 16GB VRAM (same as Actor)
-        self.conv1 = nn.Conv2d(state_dim[0], 64, kernel_size=5, stride=2)
-        self.conv2 = nn.Conv2d(64, 128, kernel_size=3, stride=2)
-        self.conv3 = nn.Conv2d(128, 128, kernel_size=3, stride=1)
+        # Shared CNN backbone with residual blocks
+        self.res1 = ResidualBlock(4, 64, stride=2)
+        self.res2 = ResidualBlock(64, 128, stride=2)
+        self.res3 = ResidualBlock(128, 256, stride=2)
+        self.adaptive_pool = nn.AdaptiveAvgPool2d((6, 6))
         
-        w, h = 17, 17
-        cnn_output_size = w * h * 128
+        # Dense features: (64 + 128 + 256) * 36 = 16,128
+        dense_size = (64 + 128 + 256) * 36
         
-        # Q1 architecture
-        self.linear1_q1 = nn.Linear(cnn_output_size + action_dim, hidden_dim)
-        self.linear2_q1 = nn.Linear(hidden_dim, hidden_dim)
+        # Q1 architecture with D2RL skip
+        self.linear1_q1 = nn.Linear(dense_size + action_dim, hidden_dim)
+        self.linear2_q1 = nn.Linear(hidden_dim + dense_size + action_dim, hidden_dim)
         self.linear3_q1 = nn.Linear(hidden_dim, 1)
 
-        # Q2 architecture
-        self.linear1_q2 = nn.Linear(cnn_output_size + action_dim, hidden_dim)
-        self.linear2_q2 = nn.Linear(hidden_dim, hidden_dim)
+        # Q2 architecture with D2RL skip
+        self.linear1_q2 = nn.Linear(dense_size + action_dim, hidden_dim)
+        self.linear2_q2 = nn.Linear(hidden_dim + dense_size + action_dim, hidden_dim)
         self.linear3_q2 = nn.Linear(hidden_dim, 1)
 
     def forward(self, state, action):
-        x = F.relu(self.conv1(state))
-        x = F.relu(self.conv2(x))
-        x = F.relu(self.conv3(x))
-        x = x.view(x.size(0), -1)
+        # Feature extraction with dense collection
+        f1 = self.res1(state)
+        f2 = self.res2(f1)
+        f3 = self.res3(f2)
         
-        xu = torch.cat([x, action], 1)
+        p1 = self.adaptive_pool(f1).flatten(1)
+        p2 = self.adaptive_pool(f2).flatten(1)
+        p3 = self.adaptive_pool(f3).flatten(1)
         
-        # Q1 forward
+        features = torch.cat([p1, p2, p3], dim=1)
+        xu = torch.cat([features, action], dim=1)
+        
+        # Q1 forward with skip
         x1 = F.relu(self.linear1_q1(xu))
-        x1 = F.relu(self.linear2_q1(x1))
+        x1 = F.relu(self.linear2_q1(torch.cat([x1, xu], dim=1)))
         x1 = self.linear3_q1(x1)
 
-        # Q2 forward
+        # Q2 forward with skip
         x2 = F.relu(self.linear1_q2(xu))
-        x2 = F.relu(self.linear2_q2(x2))
+        x2 = F.relu(self.linear2_q2(torch.cat([x2, xu], dim=1)))
         x2 = self.linear3_q2(x2)
 
         return x1, x2
+
 
 class ReplayMemory:
     def __init__(self, capacity):
@@ -142,6 +192,7 @@ class ReplayMemory:
 
     def __len__(self):
         return len(self.buffer)
+
 
 class SACAgent:
     def __init__(self, state_dim, action_dim, hidden_dim, action_limit, device):
@@ -165,6 +216,11 @@ class SACAgent:
         self.scaler_critic = GradScaler('cuda')
         self.scaler_actor = GradScaler('cuda')
         
+        # Data augmentation: Random crop (biggest proven impact for SAC + pixels)
+        self.aug = nn.Sequential(
+            K.RandomCrop((84, 84), padding=4, padding_mode='replicate'),
+        ).to(device)
+        
         self.total_steps = 0
 
     @property
@@ -172,23 +228,33 @@ class SACAgent:
         return self.log_alpha.exp()
 
     def select_action(self, state, evaluate=False):
-        state = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+        # State is uint8 (0-255) from buffer or env, normalize on fly
+        state = torch.FloatTensor(state).unsqueeze(0).to(self.device).div(255.0)
+        
         if evaluate:
             mean, _ = self.actor(state)
             return mean.cpu().data.numpy().flatten()
         else:
-            action, _ = self.actor.sample(state)
+            # No grad needed for sampling action
+            with torch.no_grad():
+                action, _ = self.actor.sample(state)
             return action.cpu().data.numpy().flatten()
 
     def update_parameters(self, memory, batch_size):
-        # Sample a batch from memory
+        # Sample a batch from memory (uint8 states)
         state_batch, action_batch, reward_batch, next_state_batch, done_batch = memory.sample(batch_size)
 
-        state_batch = torch.FloatTensor(state_batch).to(self.device)
-        next_state_batch = torch.FloatTensor(next_state_batch).to(self.device)
+        # Convert to float and normalize here (Max RAM savings!)
+        state_batch = torch.FloatTensor(state_batch).to(self.device).div(255.0)
+        next_state_batch = torch.FloatTensor(next_state_batch).to(self.device).div(255.0)
+        
         action_batch = torch.FloatTensor(action_batch).to(self.device)
         reward_batch = torch.FloatTensor(reward_batch).to(self.device).unsqueeze(1)
         done_batch = torch.FloatTensor(done_batch).to(self.device).unsqueeze(1)
+        
+        # Apply data augmentation (random crop)
+        state_batch = self.aug(state_batch)
+        next_state_batch = self.aug(next_state_batch)
         
         self.total_steps += 1
 
@@ -242,8 +308,8 @@ class SACAgent:
             'alpha': self.alpha.item()
         }, None
 
-    def save_checkpoint(self, filename, episode, best_reward):
-        torch.save({
+    def save_checkpoint(self, filename, episode, best_reward, memory=None):
+        checkpoint = {
             'episode': episode,
             'actor_state_dict': self.actor.state_dict(),
             'critic_state_dict': self.critic.state_dict(),
@@ -253,10 +319,20 @@ class SACAgent:
             'alpha_optimizer_state_dict': self.alpha_optimizer.state_dict(),
             'log_alpha': self.log_alpha,
             'best_reward': best_reward,
-            'total_steps': self.total_steps
-        }, filename)
+            'total_steps': self.total_steps,
+            'rng_state_torch': torch.get_rng_state(),
+            'rng_state_numpy': np.random.get_state(),
+            'rng_state_random': random.getstate()
+        }
+        if torch.cuda.is_available():
+            checkpoint['rng_state_cuda'] = torch.cuda.get_rng_state()
+            
+        if memory is not None:
+            checkpoint['replay_buffer'] = memory.buffer
+            # print(f"   Saved replay buffer with {len(memory)} samples") # Optional: Uncomment for debug
+        torch.save(checkpoint, filename)
 
-    def load_checkpoint(self, filename):
+    def load_checkpoint(self, filename, memory=None):
         checkpoint = torch.load(filename)
         self.actor.load_state_dict(checkpoint['actor_state_dict'])
         self.critic.load_state_dict(checkpoint['critic_state_dict'])
@@ -266,14 +342,30 @@ class SACAgent:
         self.alpha_optimizer.load_state_dict(checkpoint['alpha_optimizer_state_dict'])
         self.log_alpha = checkpoint['log_alpha']
         self.total_steps = checkpoint['total_steps']
+        
+        # Load RNG states
+        if 'rng_state_torch' in checkpoint:
+            torch.set_rng_state(checkpoint['rng_state_torch'])
+            np.random.set_state(checkpoint['rng_state_numpy'])
+            random.setstate(checkpoint['rng_state_random'])
+            if torch.cuda.is_available() and 'rng_state_cuda' in checkpoint:
+                torch.cuda.set_rng_state(checkpoint['rng_state_cuda'])
+        
+        if memory is not None and 'replay_buffer' in checkpoint:
+            memory.buffer = checkpoint['replay_buffer']
+            print(f"   Loaded replay buffer with {len(memory)} samples")
+            
         return checkpoint['episode'], checkpoint['best_reward']
+
 
 def preprocess_state(state):
     # Convert to grayscale and resize to 84x84
     # State shape is (96, 96, 3)
     gray = cv2.cvtColor(state, cv2.COLOR_RGB2GRAY)
     resized = cv2.resize(gray, (84, 84))
-    return resized / 255.0
+    # Return uint8 (0-255) to save 4x-8x RAM
+    return resized
+
 
 def stack_frames(stacked_frames, state, is_new_episode):
     frame = preprocess_state(state)
@@ -282,6 +374,18 @@ def stack_frames(stacked_frames, state, is_new_episode):
     else:
         stacked_frames.append(frame)
     return np.stack(stacked_frames, axis=0), stacked_frames
+
+
+def set_seed(seed, env=None):
+    """Set seed for reproducibility."""
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    if env:
+        env.action_space.seed(seed)
+
 
 def main():
     # Detect GPU and Enable Optimizations
@@ -298,6 +402,16 @@ def main():
         print(f"   VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
     else:
         print("⚠️  CUDA not available. Training will be slow.")
+
+    print(f"📊 Architecture: ResidualBlocks + D2RL + GroupNorm")
+    print(f"🎨 Data Augmentation: RandomCrop(84, padding=4)")
+    print(f"🔄 Action Repeat: {ACTION_REPEAT}")
+    print(f"🧠 Optimized RAM: storing uint8 frames")
+
+    # Set Seed
+    SEED = 42
+    print(f"🌱 Setting random seed to {SEED}")
+    set_seed(SEED)
 
     env = gym.make("CarRacing-v3", continuous=True, render_mode="rgb_array")
     
@@ -317,7 +431,7 @@ def main():
     if os.path.exists(LATEST_CHECKPOINT):
         print("🔄 Found checkpoint. Resuming training...")
         try:
-            start_episode, best_eval_reward = agent.load_checkpoint(LATEST_CHECKPOINT)
+            start_episode, best_eval_reward = agent.load_checkpoint(LATEST_CHECKPOINT, memory)
             print(f"   Episode: {start_episode}")
             print(f"   Best reward: {best_eval_reward:.1f}")
             # Ensure we start from the next episode
@@ -330,7 +444,7 @@ def main():
 
     try:
         for episode in range(start_episode, NUM_EPISODES):
-            state, _ = env.reset()
+            state, _ = env.reset(seed=SEED + episode)
             state, stacked_frames = stack_frames(None, state, True)
             episode_reward = 0
             
@@ -343,17 +457,20 @@ def main():
                     action = action + np.random.normal(0, EXPLORATION_NOISE, size=action_dim)
                     action = action.clip(env.action_space.low, env.action_space.high)
 
-                next_state, reward, terminated, truncated, _ = env.step(action)
-                done = terminated or truncated
+                # Action repeat (frame skipping) for sample efficiency
+                total_reward = 0
+                for _ in range(ACTION_REPEAT):
+                    next_obs, reward, terminated, truncated, _ = env.step(action)
+                    total_reward += reward
+                    done = terminated or truncated
+                    if done:
+                        break
                 
-                next_state, stacked_frames = stack_frames(stacked_frames, next_state, False)
+                next_state, stacked_frames = stack_frames(stacked_frames, next_obs, False)
                 
-                # Reward scaling (optional but often helpful for CarRacing)
-                # reward = reward / 10.0 
-                
-                memory.push(state, action, reward, next_state, done)
+                memory.push(state, action, total_reward, next_state, done)
                 state = next_state
-                episode_reward += reward
+                episode_reward += total_reward
 
                 # Updated frequency: Every 2 steps + double gradient updates
                 if len(memory) > BATCH_SIZE and agent.total_steps % 2 == 0:
@@ -377,10 +494,10 @@ def main():
                 print(f"   VRAM: {allocated:.2f}GB / {reserved:.2f}GB")
 
             # Save latest checkpoint after each episode
-            agent.save_checkpoint(LATEST_CHECKPOINT, episode, best_eval_reward)
+            agent.save_checkpoint(LATEST_CHECKPOINT, episode, best_eval_reward, memory)
 
-            # Evaluation and Best Checkpoint Saving (every 20 episodes)
-            if episode % 20 == 0:
+            # Evaluation and Best Checkpoint Saving (every 10 episodes)
+            if episode % 10 == 0:
                 avg_reward = 0
                 eval_episodes = 3 # Small eval to save time
                 
@@ -415,13 +532,13 @@ def main():
                 
                 if avg_reward > best_eval_reward:
                     best_eval_reward = avg_reward
-                    agent.save_checkpoint(os.path.join(CHECKPOINT_DIR, "best_model.pth"), episode, best_eval_reward)
+                    agent.save_checkpoint(os.path.join(CHECKPOINT_DIR, "best_model.pth"), episode, best_eval_reward, memory)
                     print(f"🏆 New best model saved!")
 
     except KeyboardInterrupt:
         print("\n⏸️  Training interrupted!")
         print("Saving checkpoint...")
-        agent.save_checkpoint(LATEST_CHECKPOINT, episode, best_eval_reward)
+        agent.save_checkpoint(LATEST_CHECKPOINT, episode, best_eval_reward, memory)
         print(f"✅ Saved: {LATEST_CHECKPOINT}")
         sys.exit(0)
     finally:
