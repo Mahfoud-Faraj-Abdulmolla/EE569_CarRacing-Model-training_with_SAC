@@ -13,6 +13,7 @@ from torch.amp import autocast, GradScaler
 import kornia.augmentation as K
 import sys
 import warnings
+import argparse
 
 # Suppress warnings (e.g. from pygame/pkg_resources)
 warnings.filterwarnings("ignore")
@@ -27,7 +28,7 @@ TAU = 0.01                             # Soft target updates
 ALPHA_INIT = 0.2
 LEARNING_RATE = 3e-4                   # Standard SAC learning rate
 MEMORY_SIZE = 300000                   # Reduced to ~150k (approx 8.5GB) to fit in 16GB RAM
-HIDDEN_SIZE = 512                      # Reduced to 256 to save VRAM and compute
+HIDDEN_SIZE = 256                      # Reduced to 256 to save VRAM and compute
 INITIAL_EXPLORATION_STEPS = 20000      # Exploration before policy training
 EXPLORATION_NOISE = 0.15               # Action noise for exploration
 ACTION_REPEAT = 2                      # Frame skipping (2 for fine steering control)
@@ -388,6 +389,20 @@ def set_seed(seed, env=None):
 
 
 def main():
+    # Parse command-line arguments
+    parser = argparse.ArgumentParser(description='Train SAC agent on CarRacing-v3')
+    parser.add_argument('--batch-size', type=int, default=BATCH_SIZE,
+                        help=f'Batch size for training (default: {BATCH_SIZE})')
+    parser.add_argument('--skip-buffer', action='store_true',
+                        help='Skip loading replay buffer from checkpoint (use for low RAM)')
+    args = parser.parse_args()
+    
+    # Use the command-line batch size (or default)
+    batch_size = args.batch_size
+    print(f"📦 Using batch size: {batch_size}")
+    if args.skip_buffer:
+        print(f"⚠️  Replay buffer loading disabled (--skip-buffer)")
+
     # Detect GPU and Enable Optimizations
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
@@ -428,12 +443,18 @@ def main():
     start_episode = 0
     best_eval_reward = -float('inf')
 
+    BEST_MODEL_CHECKPOINT = os.path.join(CHECKPOINT_DIR, "best_model.pth")
+
     if os.path.exists(LATEST_CHECKPOINT):
         print("🔄 Found checkpoint. Resuming training...")
         try:
-            start_episode, best_eval_reward = agent.load_checkpoint(LATEST_CHECKPOINT, memory)
+            # Pass None for memory if --skip-buffer is set to avoid loading the massive buffer
+            memory_to_load = None if args.skip_buffer else memory
+            start_episode, best_eval_reward = agent.load_checkpoint(LATEST_CHECKPOINT, memory_to_load)
             print(f"   Episode: {start_episode}")
-            print(f"   Best reward: {best_eval_reward:.1f}")
+            print(f"   Best reward from latest: {best_eval_reward:.1f}")
+            if args.skip_buffer:
+                print(f"   Replay buffer: SKIPPED (will start fresh)")
             # Ensure we start from the next episode
             start_episode += 1
         except Exception as e:
@@ -441,6 +462,18 @@ def main():
             print("🆕 Starting new training...")
     else:
         print("🆕 Starting new training...")
+
+    # CRITICAL: Always check the best_model.pth to prevent accidental overwriting.
+    # This handles the case where latest.pth was deleted but best_model.pth still holds the best score.
+    if os.path.exists(BEST_MODEL_CHECKPOINT):
+        try:
+            best_model_checkpoint_data = torch.load(BEST_MODEL_CHECKPOINT, map_location=device)
+            best_reward_in_file = best_model_checkpoint_data.get('best_reward', -float('inf'))
+            if best_reward_in_file > best_eval_reward:
+                print(f"🏆 Found existing best_model.pth with reward {best_reward_in_file:.1f}. Will not overwrite unless beaten.")
+                best_eval_reward = best_reward_in_file
+        except Exception as e:
+            print(f"⚠️  Could not read best_model.pth for reward comparison: {e}")
 
     try:
         for episode in range(start_episode, NUM_EPISODES):
@@ -473,9 +506,9 @@ def main():
                 episode_reward += total_reward
 
                 # Updated frequency: Every 2 steps + double gradient updates
-                if len(memory) > BATCH_SIZE and agent.total_steps % 2 == 0:
+                if len(memory) > batch_size and agent.total_steps % 2 == 0:
                     for _ in range(2):  # Double gradient updates for faster learning
-                        update_info, _ = agent.update_parameters(memory, BATCH_SIZE)
+                        update_info, _ = agent.update_parameters(memory, batch_size)
                         if update_info:
                             writer.add_scalar('Loss/critic', update_info['critic_loss'], agent.total_steps)
                             writer.add_scalar('Loss/actor', update_info['actor_loss'], agent.total_steps)
