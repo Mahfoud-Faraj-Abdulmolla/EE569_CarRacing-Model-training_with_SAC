@@ -24,7 +24,7 @@ warnings.filterwarnings("ignore")
 
 # Hyperparameters (Optimized for RTX 4050 - 6GB VRAM, 16GB RAM)
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True" # Help with fragmentation
-NUM_EPISODES = 3000                    # Longer training
+NUM_EPISODES = 5000                    # Longer training
 MAX_STEPS_PER_EPISODE = 1500           # Full lap completion
 BATCH_SIZE = 340                       # Safe default for 6GB VRAM
 GAMMA = 0.99
@@ -338,10 +338,11 @@ class SACAgent:
         for target_param, param in zip(self.target_critic.parameters(), self.critic.parameters()):
             target_param.data.copy_(target_param.data * (1.0 - TAU) + param.data * TAU)
 
+        # Return tensors to avoid CPU-GPU sync (wait for logging to call .item())
         return {
-            'actor_loss': actor_loss.item(),
-            'critic_loss': critic_loss.item(),
-            'alpha': self.alpha.item()
+            'actor_loss': actor_loss,
+            'critic_loss': critic_loss,
+            'alpha': self.alpha
         }, None
 
     def save_checkpoint(self, filename, episode, best_reward, memory=None):
@@ -473,8 +474,8 @@ def main():
                         help=f'Batch size for training (default: {BATCH_SIZE})')
     parser.add_argument('--skip-buffer', action='store_true',
                         help='Skip loading replay buffer from checkpoint (use for low RAM)')
-    parser.add_argument('--update-freq', type=int, default=2,
-                        help='Gradient update frequency (default: 2)')
+    parser.add_argument('--update-freq', type=int, default=8,
+                        help='Gradient update frequency (default: 8)')
     args = parser.parse_args()
     
     # Use the command-line batch size (or default)
@@ -610,10 +611,12 @@ def main():
                 if len(memory) > batch_size and step % update_freq == 0:
                     for _ in range(update_freq):  # Balanced updates
                         update_info, _ = agent.update_parameters(memory, batch_size)
-                        if update_info:
-                            writer.add_scalar('Loss/critic', update_info['critic_loss'], agent.total_steps)
-                            writer.add_scalar('Loss/actor', update_info['actor_loss'], agent.total_steps)
-                            writer.add_scalar('Alpha', update_info['alpha'], agent.total_steps)
+                    
+                    # Log only once per batch of updates to reduce CPU-GPU sync overhead
+                    if update_info:
+                        writer.add_scalar('Loss/critic', update_info['critic_loss'].item(), agent.total_steps)
+                        writer.add_scalar('Loss/actor', update_info['actor_loss'].item(), agent.total_steps)
+                        writer.add_scalar('Alpha', update_info['alpha'].item(), agent.total_steps)
 
                 if done:
                     break
@@ -636,8 +639,8 @@ def main():
             if is_training:
                 debug_info.append(f"Alpha: {agent.alpha.item():.3f}")
                 if update_info:
-                    debug_info.append(f"ActL: {update_info['actor_loss']:.1f}")
-                    debug_info.append(f"CriL: {update_info['critic_loss']:.1f}")
+                    debug_info.append(f"ActL: {update_info['actor_loss'].item():.1f}")
+                    debug_info.append(f"CriL: {update_info['critic_loss'].item():.1f}")
             
             debug_info.append(f"⏱️  {duration:.1f}s")
             debug_info.append(f"⚡ {fps:.1f} FPS")
