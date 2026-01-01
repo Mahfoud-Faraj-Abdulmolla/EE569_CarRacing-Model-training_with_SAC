@@ -31,7 +31,7 @@ GAMMA = 0.99
 TAU = 0.01                             # Soft target updates
 ALPHA_INIT = 0.2
 LEARNING_RATE = 3e-4                   # Standard SAC learning rate
-MEMORY_SIZE = 300000                   # 300k steps ~ 8.5GB RAM (Optimized)
+MEMORY_SIZE = 170000                   # 300k steps ~ 8.5GB RAM (Optimized)
 HIDDEN_SIZE = 256                      # Reduced to 256 to save VRAM and compute
 INITIAL_EXPLORATION_STEPS = 20000      # Exploration before policy training
 EXPLORATION_NOISE = 0.15               # Action noise for exploration
@@ -281,13 +281,13 @@ class SACAgent:
         state_batch, action_batch, reward_batch, next_state_batch, done_batch = memory.sample(batch_size)
 
         # Convert to float and normalize here (Max RAM savings!)
-        # Use torch.tensor or .to() for non_blocking support, as_tensor does not support it directly
-        state_batch = torch.as_tensor(state_batch, device=self.device).float().div_(255.0)
-        next_state_batch = torch.as_tensor(next_state_batch, device=self.device).float().div_(255.0)
+        # Use .to(..., non_blocking=True) for async transfer
+        state_batch = torch.as_tensor(state_batch).to(self.device, non_blocking=True).float().div_(255.0)
+        next_state_batch = torch.as_tensor(next_state_batch).to(self.device, non_blocking=True).float().div_(255.0)
         
-        action_batch = torch.as_tensor(action_batch, device=self.device).float()
-        reward_batch = torch.as_tensor(reward_batch, device=self.device).float()
-        done_batch = torch.as_tensor(done_batch, device=self.device).float()
+        action_batch = torch.as_tensor(action_batch).to(self.device, non_blocking=True).float()
+        reward_batch = torch.as_tensor(reward_batch).to(self.device, non_blocking=True).float()
+        done_batch = torch.as_tensor(done_batch).to(self.device, non_blocking=True).float()
         
         # Apply data augmentation (random crop)
         # Optimization: Batch the augmentation to reduce kernel launches
@@ -498,8 +498,8 @@ def main():
                         help=f'Batch size for training (default: {BATCH_SIZE})')
     parser.add_argument('--skip-buffer', action='store_true',
                         help='Skip loading replay buffer from checkpoint (use for low RAM)')
-    parser.add_argument('--update-freq', type=int, default=8,
-                        help='Gradient update frequency (default: 8)')
+    parser.add_argument('--update-freq', type=int, default=16,
+                        help='Gradient update frequency (default: 16)')
     parser.add_argument('--no-compile', action='store_true',
                         help='Disable torch.compile (for debugging FPS issues)')
     args = parser.parse_args()
@@ -635,9 +635,11 @@ def main():
 
                 # Updated frequency: Every N environment steps
                 if len(memory) > batch_size and step % update_freq == 0:
-                    # Reduce update ratio to 0.5 updates per step to save GPU
+                    # Reduce update ratio to 0.25 updates per step (1 update every 4 steps) to boost FPS
+                    # Previously was 0.5 (1 update every 2 steps)
+                    updates_to_run = max(1, update_freq // 4)
                     update_info = None
-                    for _ in range(max(1, update_freq // 2)): 
+                    for _ in range(updates_to_run): 
                         update_info, _ = agent.update_parameters(memory, batch_size)
                     
                     # Log less frequently to avoid CPU-GPU sync stall (every 50 updates)
