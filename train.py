@@ -24,14 +24,14 @@ warnings.filterwarnings("ignore")
 
 # Hyperparameters (Optimized for RTX 4050 - 6GB VRAM, 16GB RAM)
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True" # Help with fragmentation
-NUM_EPISODES = 5000                    # Longer training
+NUM_EPISODES = 7000                    # Longer training
 MAX_STEPS_PER_EPISODE = 1500           # Full lap completion
-BATCH_SIZE = 400                       # Safe default for 6GB VRAM
+BATCH_SIZE = 256                       # Safe default for 6GB VRAM
 GAMMA = 0.99
 TAU = 0.01                             # Soft target updates
 ALPHA_INIT = 0.2
 LEARNING_RATE = 3e-4                   # Standard SAC learning rate
-MEMORY_SIZE = 180000                   # 300k steps ~ 8.5GB RAM (Optimized)
+MEMORY_SIZE = 200000                  # 300k steps ~ 8.5GB RAM (Optimized)
 HIDDEN_SIZE = 256                      # Reduced to 256 to save VRAM and compute
 INITIAL_EXPLORATION_STEPS = 20000      # Exploration before policy training
 EXPLORATION_NOISE = 0.15               # Action noise for exploration
@@ -117,7 +117,13 @@ class ActorNetwork(nn.Module):
         x = F.relu(self.fc2(torch.cat([x, features], dim=1)))
         
         mean = self.mean(x)
-        log_std = torch.clamp(self.log_std(x), -20, 2)
+        
+        # FIX: Use tanh squashing instead of hard clamp to prevent dead gradients
+        # log_std = torch.clamp(self.log_std(x), -20, 2) 
+        log_std = self.log_std(x)
+        log_std = torch.tanh(log_std)
+        log_std = -20 + 0.5 * (2 - (-20)) * (log_std + 1) # Map -1..1 to -20..2
+
         return mean, log_std
 
     def sample(self, state):
@@ -337,6 +343,10 @@ class SACAgent:
         alpha_loss.backward()
         self.alpha_optimizer.step()
 
+        # FIX: Clamp log_alpha to prevent explosion if policy gets stuck
+        with torch.no_grad():
+            self.log_alpha.clamp_(max=5.0)
+
         # Soft update target network
         for target_param, param in zip(self.target_critic.parameters(), self.critic.parameters()):
             target_param.data.copy_(target_param.data * (1.0 - TAU) + param.data * TAU)
@@ -402,8 +412,8 @@ class SACAgent:
         # Check for stuck alpha (> 0.9) from previous runs and reset if needed
         current_alpha = loaded_log_alpha.exp().item() if isinstance(loaded_log_alpha, torch.Tensor) else np.exp(loaded_log_alpha)
         reset_alpha = False
-        if current_alpha > 0.9:
-            print(f"   🔧 Detected stuck Alpha ({current_alpha:.3f} > 0.9). Resetting to ALPHA_INIT ({self.alpha_init}).")
+        if current_alpha > 0.5:
+            print(f"   🔧 Detected stuck Alpha ({current_alpha:.3f} > 0.5). Resetting to ALPHA_INIT ({self.alpha_init}).")
             self.log_alpha = torch.tensor([np.log(self.alpha_init)], requires_grad=True, device=self.device, dtype=torch.float32)
             reset_alpha = True
         else:
